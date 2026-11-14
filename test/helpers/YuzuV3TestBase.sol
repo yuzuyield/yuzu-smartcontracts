@@ -154,4 +154,11 @@ abstract contract YuzuV3TestBase is Test {
         yzilp.endPoolUpdate();
         vm.stopPrank();
     }
+
+    /// @dev Delta-based residual assertion (finding F2): a helper's asset balance must return to
+    /// its own {entryBalance} snapshot after every call, never to an absolute zero. Comparing to
+    /// zero would let a 1-wei third-party donation permanently brick every future call.
+    function assertNoResidualDelta(address helper, uint256 entryBalance) internal view {
+        assertEq(asset.balanceOf(helper), entryBalance, "helper asset balance drifted from its entry snapshot");
+    }
 }
