@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.30;
 
-import {
-    AccessControlDefaultAdminRules
-} from "@openzeppelin/contracts/access/extensions/AccessControlDefaultAdminRules.sol";
+import {AccessControlDefaultAdminRules} from
+    "@openzeppelin/contracts/access/extensions/AccessControlDefaultAdminRules.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {SafeERC20, IERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -139,6 +138,8 @@ contract YuzuRedeemOrderHelper is IYuzuRedeemOrderHelper, AccessControlDefaultAd
     /// @param admin_ Holds the two-step-transferable `DEFAULT_ADMIN_ROLE`, which only appoints
     /// `ADMIN_ROLE` holders.
     /// @param operator_ Initial `ADMIN_ROLE` holder: fee, pause recovery, cancels, role grants.
+    // The only external call is the read-only `isUpdatingPool()` probe of the bound vault.
+    // slither-disable-next-line pess-call-forward-to-protected
     constructor(address vault_, address asset_, address admin_, address operator_)
         AccessControlDefaultAdminRules(0, admin_)
     {
@@ -154,7 +155,7 @@ contract YuzuRedeemOrderHelper is IYuzuRedeemOrderHelper, AccessControlDefaultAd
 
         // Neither V3 router installs a catch-all fallback, so an absent `isUpdatingPool()` reverts
         // rather than returning empty success — the probe cannot mis-classify a yzUSD vault.
-        // slither-disable-next-line low-level-calls
+        // slither-disable-next-line low-level-calls,pess-arbitrary-call-destination-tainted
         (bool ok, bytes memory ret) = vault_.staticcall(abi.encodeCall(IYuzuILPV2.isUpdatingPool, ()));
         _vaultExposesPoolUpdateFlag = ok && ret.length == 32;
 
@@ -164,6 +165,8 @@ contract YuzuRedeemOrderHelper is IYuzuRedeemOrderHelper, AccessControlDefaultAd
     }
 
     /// @inheritdoc IYuzuRedeemOrderHelper
+    // Trusted vault; the order id is only known after the vault call.
+    // slither-disable-next-line reentrancy-benign
     function createRedeemOrderWithMaxFee(
         uint256 tokens,
         address receiver,
@@ -186,10 +189,13 @@ contract YuzuRedeemOrderHelper is IYuzuRedeemOrderHelper, AccessControlDefaultAd
             orderFeeTokens[orderId] = feeTokens;
             totalEscrowedFeeShares += feeTokens;
         }
+        // slither-disable-next-line reentrancy-events
         emit CreatedRedeemOrder(orderId, orderOwner, receiver, tokens - feeTokens, maxFeePpm, minAssetsOut);
     }
 
     /// @inheritdoc IYuzuRedeemOrderHelper
+    // Trusted vault, and nonReentrant.
+    // slither-disable-next-line reentrancy-benign
     function fillAndFinalizeRedeemOrder(uint256 orderId, uint256 maxAssets, uint256 execDeadline)
         external
         nonReentrant
@@ -214,12 +220,14 @@ contract YuzuRedeemOrderHelper is IYuzuRedeemOrderHelper, AccessControlDefaultAd
     }
 
     /// @inheritdoc IYuzuRedeemOrderHelper
+    // slither-disable-next-line reentrancy-benign
     function finalizeRedeemOrder(uint256 orderId) external nonReentrant {
         _vault.finalizeRedeemOrder(orderId);
         _settleFee(orderId);
     }
 
     /// @inheritdoc IYuzuRedeemOrderHelper
+    // slither-disable-next-line reentrancy-benign
     function cancelOwnRedeemOrder(uint256 orderId) external nonReentrant {
         _checkRole(ADMIN_ROLE);
         Order memory order = _vault.getRedeemOrder(orderId);
@@ -250,6 +258,8 @@ contract YuzuRedeemOrderHelper is IYuzuRedeemOrderHelper, AccessControlDefaultAd
     }
 
     /// @notice Sets the helper fee. A non-zero rate needs a non-zero recipient.
+    // Guarded by `_checkRole(ADMIN_ROLE)` in the body.
+    // slither-disable-next-line pess-unprotected-setter
     function setFee(uint16 newFeeBps, address newFeeRecipient) external {
         _checkRole(ADMIN_ROLE);
         if (newFeeBps > MAX_FEE_BPS) {

@@ -918,8 +918,7 @@ contract YuzuRedeemOrderHelperTest is YuzuV3TestBase {
     /// it, this whole test would revert instead of asserting a finalized order.
     function test_F1_SettlementNeverCallsPreviewRedeemOrder() public {
         RevertingPreviewVault mockVault = new RevertingPreviewVault(address(asset));
-        YuzuRedeemOrderHelper mockHelper =
-            new YuzuRedeemOrderHelper(address(mockVault), address(asset), admin, admin);
+        YuzuRedeemOrderHelper mockHelper = new YuzuRedeemOrderHelper(address(mockVault), address(asset), admin, admin);
 
         bytes32 fillerRole = mockHelper.FILLER_ROLE();
         vm.prank(admin);
