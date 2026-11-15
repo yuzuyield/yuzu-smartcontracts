@@ -61,8 +61,11 @@ import {Order, OrderStatus} from "../interfaces/proto/IYuzuOrderBookDefinitions.
  *   `isUpdatingPool()`.
  * - **Owner price floor.** `fillRedeemOrder` prices at the fill block, and the filler picks that
  *   block; the owner cannot cancel before `dueTime`. `createRedeemOrderWithMaxFee` therefore
- *   requires a non-zero `minAssetsOut`, recorded per order and enforced after fill and before
- *   finalize against the vault's own settled `order.assets` — never a pre-fill preview.
+ *   requires a non-zero `minAssetsOut`, recorded per order and checked against the vault's own
+ *   settled `order.assets` — never a pre-fill preview — on both helper payout paths: the fill
+ *   (before finalize) and the finalize passthrough. Another vault `ORDER_FILLER_ROLE` holder can
+ *   still fill a helper order at the vault below the floor; only helper fills honour it, so that
+ *   role should be held by this helper alone.
  *
  * @dev Access and fee:
  *
@@ -222,6 +225,13 @@ contract YuzuRedeemOrderHelper is IYuzuRedeemOrderHelper, AccessControlDefaultAd
     /// @inheritdoc IYuzuRedeemOrderHelper
     // slither-disable-next-line reentrancy-benign
     function finalizeRedeemOrder(uint256 orderId) external nonReentrant {
+        // An order another vault filler filled below the owner's floor is not paid out through this
+        // helper; its owner can still finalize it directly at the vault. Other states fall through
+        // to the vault's own checks.
+        Order memory order = _vault.getRedeemOrder(orderId);
+        if (order.status == OrderStatus.Filled && order.assets < orderMinAssetsOut[orderId]) {
+            revert MinAssetsOutNotMet(order.assets, orderMinAssetsOut[orderId]);
+        }
         _vault.finalizeRedeemOrder(orderId);
         _settleFee(orderId);
     }

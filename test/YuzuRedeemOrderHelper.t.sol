@@ -690,10 +690,10 @@ contract YuzuRedeemOrderHelperTest is YuzuV3TestBase {
         assertEq(ilpHelper.totalEscrowedFeeShares(), 0, "escrow total not cleared");
     }
 
-    /// @dev Another vault filler settles the order below the owner's floor after a NAV drop. The floor
-    /// is enforced only on this helper's own fill path, so the finalized order still pays the
-    /// recipient the escrowed fee.
-    function test_HelperFee_FilledElsewhereBelowFloor_StillCharged() public {
+    /// @dev Another vault filler settles the order below the owner's floor after a NAV drop. The
+    /// helper refuses to pay that order out; the owner can still finalize it directly at the vault,
+    /// and the escrowed fee then settles to the recipient.
+    function test_FilledElsewhereBelowFloor_HelperFinalizeReverts_OwnerFinalizesAtVault() public {
         address collector = makeAddr("collector");
         (uint256 orderId,, uint256 feeTokens,) = _createFeeOrder(collector);
 
@@ -702,14 +702,37 @@ contract YuzuRedeemOrderHelperTest is YuzuV3TestBase {
         _approve(filler, address(yzilp));
         vm.prank(filler);
         yzilp.fillRedeemOrder(orderId);
-        assertLt(yzilp.getRedeemOrder(orderId).assets, ilpHelper.orderMinAssetsOut(orderId), "setup: not below floor");
+        uint256 settled = yzilp.getRedeemOrder(orderId).assets;
+        uint256 floor = ilpHelper.orderMinAssetsOut(orderId);
+        assertLt(settled, floor, "setup: not below floor");
 
-        vm.expectEmit(true, true, true, true, address(ilpHelper));
-        emit IYuzuRedeemOrderHelper.ChargedFee(orderId, user, collector, feeTokens);
+        vm.prank(other);
+        vm.expectRevert(abi.encodeWithSelector(YuzuRedeemOrderHelper.MinAssetsOutNotMet.selector, settled, floor));
         ilpHelper.finalizeRedeemOrder(orderId);
+        assertEq(uint256(yzilp.getRedeemOrder(orderId).status), uint256(OrderStatus.Filled), "order moved");
 
-        assertEq(yzilp.balanceOf(collector), feeTokens, "below-floor fill was not charged");
-        assertEq(yzilp.balanceOf(user), 0, "owner should not be refunded");
+        uint256 userAssetsBefore = asset.balanceOf(user);
+        vm.prank(user);
+        yzilp.finalizeRedeemOrder(orderId);
+        assertEq(asset.balanceOf(user), userAssetsBefore + settled, "owner not paid at the vault");
+
+        ilpHelper.settleFee(orderId);
+        assertEq(yzilp.balanceOf(collector), feeTokens, "fee not settled after owner finalize");
+        assertEq(ilpHelper.totalEscrowedFeeShares(), 0, "escrow not released");
+    }
+
+    /// @dev The floor check applies only to Filled orders: finalizing a Pending order still fails
+    /// with the vault's own error, not a misleading floor error.
+    function test_FinalizePassthrough_PendingOrder_VaultErrorUnchanged() public {
+        (uint256 orderId,,,) = _createFeeOrder(makeAddr("collector"));
+        vm.expectRevert();
+        ilpHelper.finalizeRedeemOrder(orderId);
+        try ilpHelper.finalizeRedeemOrder(orderId) {}
+        catch (bytes memory err) {
+            assertTrue(
+                bytes4(err) != YuzuRedeemOrderHelper.MinAssetsOutNotMet.selector, "floor error on a pending order"
+            );
+        }
     }
 
     /// @dev (g) `settleFee` refuses a Pending order and a Filled-but-not-finalized order (the payout

@@ -237,6 +237,23 @@ contract YuzuRedeemOrderHelperInvariantHandler is CommonBase, StdCheats, StdUtil
         address finalizer = _actor(finalizerSeed / 2);
         uint256 receiverBalBefore = asset.balanceOf(order.receiver);
         if (viaHelper) {
+            // Filled below the owner's floor by another filler: the helper must refuse, and the
+            // owner must still be able to finalize at the vault.
+            if (vault.getRedeemOrder(orderId).assets < helper.orderMinAssetsOut(orderId)) {
+                vm.prank(finalizer);
+                try helper.finalizeRedeemOrder(orderId) {
+                    unexpectedFinalizeFailures++;
+                } catch (bytes memory err) {
+                    if (bytes4(err) != YuzuRedeemOrderHelper.MinAssetsOutNotMet.selector) unexpectedFinalizeFailures++;
+                }
+                vm.prank(order.owner);
+                try vault.finalizeRedeemOrder(orderId) {
+                    finalizedAtVaultCount++;
+                } catch {
+                    unexpectedFinalizeFailures++;
+                }
+                return;
+            }
             vm.prank(finalizer);
             try helper.finalizeRedeemOrder(orderId) {
                 assetsSettledAccordingToVault += vault.getRedeemOrder(orderId).assets;

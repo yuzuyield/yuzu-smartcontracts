@@ -77,7 +77,9 @@ interface IYuzuRedeemOrderHelper {
 
     /// @notice Permissionless passthrough to the vault's `finalizeRedeemOrder` for any filled order
     /// this helper controls (e.g. after a pause cleared, or one filled by another vault filler),
-    /// then {settleFee}. Not gated by a staged restatement: it pays only the amount fixed at fill.
+    /// then {settleFee}. Reverts `MinAssetsOutNotMet` for an order filled below its
+    /// `orderMinAssetsOut`; only its owner can then finalize it, directly at the vault. Not gated by
+    /// a staged restatement: it pays only the amount fixed at fill.
     function finalizeRedeemOrder(uint256 orderId) external;
 
     /// @notice Cancels a pending order the helper created, refusing every other order. This is the
