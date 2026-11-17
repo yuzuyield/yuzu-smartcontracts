@@ -527,7 +527,10 @@ contract YuzuRedeemOrderHelper is IYuzuRedeemOrderHelper, AccessControlDefaultAd
         uint256 used = _usedNow(usage, limit);
         remaining = limit > used ? limit - used : 0;
         if (assets <= remaining) {
+            // Exact: used + assets <= limit <= type(uint192).max; block.timestamp fits uint64.
+            // slither-disable-next-line pess-dubious-typecast
             usage.used = uint192(used + assets);
+            // slither-disable-next-line pess-dubious-typecast
             usage.updatedAt = uint64(block.timestamp);
         }
     }
