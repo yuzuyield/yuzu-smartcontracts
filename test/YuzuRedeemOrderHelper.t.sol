@@ -141,6 +141,14 @@ contract YuzuRedeemOrderHelperTest is YuzuV3TestBase {
         usdHelper.grantRole(usdHelper.FILLER_ROLE(), helperFiller);
         ilpHelper.grantRole(ilpHelper.PAUSE_MANAGER_ROLE(), admin);
         usdHelper.grantRole(usdHelper.PAUSE_MANAGER_ROLE(), admin);
+        ilpHelper.setWhitelistEnabled(false);
+        usdHelper.setWhitelistEnabled(false);
+        ilpHelper.grantRole(ilpHelper.LIMIT_MANAGER_ROLE(), admin);
+        usdHelper.grantRole(usdHelper.LIMIT_MANAGER_ROLE(), admin);
+        ilpHelper.grantRole(ilpHelper.CANCEL_MANAGER_ROLE(), admin);
+        usdHelper.grantRole(usdHelper.CANCEL_MANAGER_ROLE(), admin);
+        ilpHelper.setLimits(type(uint256).max, type(uint256).max, type(uint256).max);
+        usdHelper.setLimits(type(uint256).max, type(uint256).max, type(uint256).max);
         vm.stopPrank();
 
         vm.startPrank(user);
@@ -944,8 +952,12 @@ contract YuzuRedeemOrderHelperTest is YuzuV3TestBase {
         YuzuRedeemOrderHelper mockHelper = new YuzuRedeemOrderHelper(address(mockVault), address(asset), admin, admin);
 
         bytes32 fillerRole = mockHelper.FILLER_ROLE();
-        vm.prank(admin);
+        vm.startPrank(admin);
         mockHelper.grantRole(fillerRole, helperFiller);
+        mockHelper.setWhitelistEnabled(false);
+        mockHelper.grantRole(mockHelper.LIMIT_MANAGER_ROLE(), admin);
+        mockHelper.setLimits(type(uint256).max, type(uint256).max, type(uint256).max);
+        vm.stopPrank();
         vm.prank(helperFiller);
         asset.approve(address(mockHelper), type(uint256).max);
 
@@ -1200,5 +1212,366 @@ contract YuzuRedeemOrderHelperTest is YuzuV3TestBase {
 
         assertEq(asset.balanceOf(treasury), treasuryBefore + 1_234e6, "donation not recovered");
         assertEq(asset.balanceOf(address(ilpHelper)), 0, "helper still holds the donation");
+    }
+
+    // --- helper whitelist ----------------------------------------------------------------------
+
+    /// @dev Deposits `assets` for `who` and creates a helper order for the full share balance.
+    function _createOrder(address who, uint256 assets) internal returns (uint256 orderId, uint256 expectedAssets) {
+        vm.startPrank(who);
+        uint256 shares = yzilp.deposit(assets, who);
+        yzilp.approve(address(ilpHelper), shares);
+        orderId = ilpHelper.createRedeemOrderWithMaxFee(shares, who, 1e6, 100, 1);
+        vm.stopPrank();
+        expectedAssets = yzilp.previewRedeemOrder(shares);
+    }
+
+    function _fill(uint256 orderId, uint256 expectedAssets) internal {
+        vm.prank(helperFiller);
+        ilpHelper.fillAndFinalizeRedeemOrder(orderId, expectedAssets, block.timestamp + 1 days);
+    }
+
+    function _whitelist(address account, bool allowed) internal {
+        address[] memory accounts = new address[](1);
+        accounts[0] = account;
+        vm.startPrank(admin);
+        ilpHelper.grantRole(ilpHelper.WHITELIST_MANAGER_ROLE(), admin);
+        ilpHelper.setWhitelisted(accounts, allowed);
+        vm.stopPrank();
+    }
+
+    function test_Whitelist_OnByDefault() public {
+        YuzuRedeemOrderHelper fresh = new YuzuRedeemOrderHelper(address(yzilp), address(asset), admin, admin);
+        assertTrue(fresh.whitelistEnabled());
+
+        vm.startPrank(user);
+        uint256 shares = yzilp.deposit(100e6, user);
+        yzilp.approve(address(fresh), shares);
+        vm.expectRevert(abi.encodeWithSelector(YuzuRedeemOrderHelper.NotWhitelisted.selector, user));
+        fresh.createRedeemOrderWithMaxFee(shares, user, 1e6, 100, 1);
+        vm.stopPrank();
+    }
+
+    /// @dev Only listed owners create; delisting a partner also stops the fill of their pending
+    /// order, which stays Pending rather than being lost.
+    function test_Whitelist_GatesCreateAndFill() public {
+        vm.prank(admin);
+        ilpHelper.setWhitelistEnabled(true);
+        _whitelist(user, true);
+
+        vm.startPrank(other);
+        uint256 otherShares = yzilp.deposit(100e6, other);
+        yzilp.approve(address(ilpHelper), otherShares);
+        vm.expectRevert(abi.encodeWithSelector(YuzuRedeemOrderHelper.NotWhitelisted.selector, other));
+        ilpHelper.createRedeemOrderWithMaxFee(otherShares, other, 1e6, 100, 1);
+        vm.stopPrank();
+
+        (uint256 orderId, uint256 expectedAssets) = _createOrder(user, 100e6);
+        _whitelist(user, false);
+
+        vm.prank(helperFiller);
+        vm.expectRevert(abi.encodeWithSelector(YuzuRedeemOrderHelper.NotWhitelisted.selector, user));
+        ilpHelper.fillAndFinalizeRedeemOrder(orderId, expectedAssets, block.timestamp + 1 days);
+        assertEq(uint256(yzilp.getRedeemOrder(orderId).status), uint256(OrderStatus.Pending));
+
+        _whitelist(user, true);
+        _fill(orderId, expectedAssets);
+        assertEq(uint256(yzilp.getRedeemOrder(orderId).status), uint256(OrderStatus.Finalized));
+    }
+
+    /// @dev The helper list adds to the vault's own `REDEEMER_ROLE` list; it never replaces it.
+    function test_Whitelist_VaultRedeemerListStillApplies() public {
+        vm.startPrank(admin);
+        ilpHelper.setWhitelistEnabled(true);
+        yzilp.grantRole(RESTRICTION_MANAGER_ROLE, admin);
+        yzilp.setIsRedeemRestricted(true);
+        vm.stopPrank();
+        _whitelist(user, true);
+
+        vm.startPrank(user);
+        uint256 shares = yzilp.deposit(100e6, user);
+        vm.expectRevert(
+            abi.encodeWithSelector(IYuzuOrderBookDefinitions.ExceededMaxRedeemOrder.selector, user, shares, 0)
+        );
+        ilpHelper.createRedeemOrderWithMaxFee(shares, user, 1e6, 100, 1);
+        vm.stopPrank();
+    }
+
+    function test_Whitelist_SetterAccess() public {
+        address[] memory accounts = new address[](1);
+        accounts[0] = other;
+        vm.startPrank(other);
+        vm.expectRevert();
+        ilpHelper.setWhitelisted(accounts, true);
+        vm.expectRevert();
+        ilpHelper.setWhitelistEnabled(false);
+        vm.stopPrank();
+
+        // The list manager cannot open the helper; only ADMIN_ROLE can.
+        bytes32 listRole = ilpHelper.WHITELIST_MANAGER_ROLE();
+        vm.prank(admin);
+        ilpHelper.grantRole(listRole, other);
+        vm.startPrank(other);
+        ilpHelper.setWhitelisted(accounts, true);
+        vm.expectRevert();
+        ilpHelper.setWhitelistEnabled(false);
+        vm.stopPrank();
+        assertTrue(ilpHelper.isWhitelisted(other));
+    }
+
+    /// @dev Switching the gate never edits the list: off admits anyone the vault allows, and on
+    /// again restores exactly the partners listed before.
+    function test_Whitelist_ToggleKeepsList() public {
+        vm.prank(admin);
+        ilpHelper.setWhitelistEnabled(true);
+        _whitelist(user, true);
+
+        vm.prank(admin);
+        ilpHelper.setWhitelistEnabled(false);
+        (uint256 otherOrder, uint256 otherAssets) = _createOrder(other, 100e6);
+
+        vm.prank(admin);
+        ilpHelper.setWhitelistEnabled(true);
+        assertTrue(ilpHelper.isWhitelisted(user), "list lost on toggle");
+        assertFalse(ilpHelper.isWhitelisted(other), "toggle-off admission leaked into the list");
+        _createOrder(user, 100e6);
+
+        // An order created while open is gated again once the list is back on.
+        vm.prank(helperFiller);
+        vm.expectRevert(abi.encodeWithSelector(YuzuRedeemOrderHelper.NotWhitelisted.selector, other));
+        ilpHelper.fillAndFinalizeRedeemOrder(otherOrder, otherAssets, block.timestamp + 1 days);
+    }
+
+    /// @dev Delisting stops helper fills but never traps funds: the owner's own vault cancel after
+    /// `dueTime` plus {settleFee}, and the admin's `cancelOwnRedeemOrder`, both return every share,
+    /// the escrowed helper fee included.
+    function test_Whitelist_DelistedOwnerRecoversShares() public {
+        address collector = makeAddr("collector");
+        vm.prank(admin);
+        ilpHelper.setWhitelistEnabled(true);
+        _whitelist(user, true);
+
+        (uint256 orderId, uint256 shares,,) = _createFeeOrder(collector);
+        _whitelist(user, false);
+
+        vm.warp(block.timestamp + yzilp.fillWindow());
+        vm.prank(user);
+        yzilp.cancelRedeemOrder(orderId);
+        vm.prank(other);
+        ilpHelper.settleFee(orderId);
+        assertEq(yzilp.balanceOf(user), shares, "owner vault cancel did not return every share");
+
+        _whitelist(user, true);
+        vm.prank(user);
+        uint256 secondOrder = ilpHelper.createRedeemOrderWithMaxFee(shares, user, 1e6, 100, 1);
+        _whitelist(user, false);
+
+        vm.prank(admin);
+        ilpHelper.cancelOwnRedeemOrder(secondOrder);
+        assertEq(yzilp.balanceOf(user), shares, "admin cancel did not return every share");
+        assertEq(ilpHelper.totalEscrowedFeeShares(), 0, "fee left in escrow");
+    }
+
+    /// @dev An order already filled (by another vault filler) is paid out through the helper's
+    /// permissionless finalize even after its owner is delisted: the payout is never gated.
+    function test_Whitelist_DelistedOwnerFilledOrderStillFinalizes() public {
+        vm.prank(admin);
+        ilpHelper.setWhitelistEnabled(true);
+        _whitelist(user, true);
+        (uint256 orderId,) = _createOrder(user, 100e6);
+
+        asset.mint(filler, 1_000e6);
+        _approve(filler, address(yzilp));
+        vm.prank(filler);
+        yzilp.fillRedeemOrder(orderId);
+        _whitelist(user, false);
+
+        uint256 balBefore = asset.balanceOf(user);
+        uint256 settled = yzilp.getRedeemOrder(orderId).assets;
+        vm.prank(other);
+        ilpHelper.finalizeRedeemOrder(orderId);
+        assertEq(asset.balanceOf(user), balBefore + settled, "delisted owner not paid");
+    }
+
+    /// @dev The gate truth table: creation succeeds exactly when the list is off or the owner is on it.
+    function testFuzz_Whitelist_CreateGate(bool enabled, bool listed) public {
+        vm.prank(admin);
+        ilpHelper.setWhitelistEnabled(enabled);
+        _whitelist(user, listed);
+
+        vm.startPrank(user);
+        uint256 shares = yzilp.deposit(100e6, user);
+        yzilp.approve(address(ilpHelper), shares);
+        if (enabled && !listed) {
+            vm.expectRevert(abi.encodeWithSelector(YuzuRedeemOrderHelper.NotWhitelisted.selector, user));
+        }
+        ilpHelper.createRedeemOrderWithMaxFee(shares, user, 1e6, 100, 1);
+        vm.stopPrank();
+    }
+
+    // --- outflow limits ------------------------------------------------------------------------
+
+    function _setLimits(uint256 txCap_, uint256 accountLimit_, uint256 totalLimit_) internal {
+        vm.prank(admin);
+        ilpHelper.setLimits(txCap_, accountLimit_, totalLimit_);
+    }
+
+    function test_Limits_FreshHelperFailsClosed() public {
+        YuzuRedeemOrderHelper fresh = new YuzuRedeemOrderHelper(address(yzilp), address(asset), admin, admin);
+        bytes32 fillerRole = fresh.FILLER_ROLE();
+        bytes32 listRole = fresh.WHITELIST_MANAGER_ROLE();
+        address[] memory partners = new address[](1);
+        partners[0] = user;
+        vm.startPrank(admin);
+        yzilp.grantRole(ORDER_FILLER_ROLE, address(fresh));
+        fresh.grantRole(fillerRole, helperFiller);
+        fresh.grantRole(listRole, admin);
+        fresh.setWhitelisted(partners, true);
+        vm.stopPrank();
+        vm.prank(helperFiller);
+        asset.approve(address(fresh), type(uint256).max);
+
+        vm.startPrank(user);
+        uint256 shares = yzilp.deposit(100e6, user);
+        yzilp.approve(address(fresh), shares);
+        uint256 orderId = fresh.createRedeemOrderWithMaxFee(shares, user, 1e6, 100, 1);
+        vm.stopPrank();
+        uint256 expectedAssets = yzilp.previewRedeemOrder(shares);
+
+        vm.prank(helperFiller);
+        vm.expectRevert(abi.encodeWithSelector(YuzuRedeemOrderHelper.AboveTxCap.selector, expectedAssets, 0));
+        fresh.fillAndFinalizeRedeemOrder(orderId, expectedAssets, block.timestamp + 1 days);
+        assertEq(uint256(yzilp.getRedeemOrder(orderId).status), uint256(OrderStatus.Pending));
+    }
+
+    function test_Limits_TxCapBlocksLargeFillOnly() public {
+        (uint256 small, uint256 smallAssets) = _createOrder(user, 100e6);
+        (uint256 large, uint256 largeAssets) = _createOrder(user, 300e6);
+        _setLimits(smallAssets, type(uint256).max, type(uint256).max);
+
+        vm.prank(helperFiller);
+        vm.expectRevert(abi.encodeWithSelector(YuzuRedeemOrderHelper.AboveTxCap.selector, largeAssets, smallAssets));
+        ilpHelper.fillAndFinalizeRedeemOrder(large, largeAssets, block.timestamp + 1 days);
+        assertEq(uint256(yzilp.getRedeemOrder(large).status), uint256(OrderStatus.Pending), "large order lost");
+
+        _fill(small, smallAssets);
+        assertEq(uint256(yzilp.getRedeemOrder(small).status), uint256(OrderStatus.Finalized));
+    }
+
+    /// @dev One owner exhausting its limit must not touch another owner's, and the limit refills
+    /// linearly: half after 12h, all of it after 24h.
+    function test_Limits_AccountLimitIsPerOwnerAndRefills() public {
+        (uint256 a1, uint256 assets1) = _createOrder(user, 100e6);
+        (uint256 a2, uint256 assets2) = _createOrder(user, 100e6);
+        (uint256 b1, uint256 assetsB) = _createOrder(other, 100e6);
+        uint256 limit = assets1 + assets2 / 2;
+        _setLimits(type(uint256).max, limit, type(uint256).max);
+
+        _fill(a1, assets1);
+        assertEq(ilpHelper.remainingAccountLimit(user), limit - assets1);
+
+        vm.prank(helperFiller);
+        vm.expectRevert(
+            abi.encodeWithSelector(YuzuRedeemOrderHelper.AccountLimitExceeded.selector, user, assets2, limit - assets1)
+        );
+        ilpHelper.fillAndFinalizeRedeemOrder(a2, assets2, block.timestamp + 1 days);
+
+        _fill(b1, assetsB);
+        assertEq(ilpHelper.remainingAccountLimit(other), limit - assetsB, "other owner's limit was shared");
+
+        // Absolute targets: under via_ir, `block.timestamp` after a warp can read the cached value.
+        uint256 t0 = block.timestamp;
+        vm.warp(t0 + 12 hours);
+        assertEq(ilpHelper.remainingAccountLimit(user), limit - assets1 + limit / 2, "not half refilled");
+        _fill(a2, assets2);
+
+        vm.warp(t0 + 36 hours);
+        assertEq(ilpHelper.remainingAccountLimit(user), limit, "not fully refilled after a quiet window");
+    }
+
+    function test_Limits_TotalLimitAcrossOwners() public {
+        (uint256 a1, uint256 assetsA) = _createOrder(user, 100e6);
+        (uint256 b1, uint256 assetsB) = _createOrder(other, 100e6);
+        uint256 limit = assetsA + assetsB - 1;
+        _setLimits(type(uint256).max, type(uint256).max, limit);
+
+        _fill(a1, assetsA);
+        vm.prank(helperFiller);
+        vm.expectRevert(
+            abi.encodeWithSelector(YuzuRedeemOrderHelper.TotalLimitExceeded.selector, assetsB, limit - assetsA)
+        );
+        ilpHelper.fillAndFinalizeRedeemOrder(b1, assetsB, block.timestamp + 1 days);
+
+        vm.warp(block.timestamp + 1 hours);
+        _fill(b1, assetsB);
+        assertEq(uint256(yzilp.getRedeemOrder(b1).status), uint256(OrderStatus.Finalized));
+    }
+
+    /// @dev Lowering a limit under recorded usage leaves no capacity until usage decays at the new
+    /// rate; it never underflows or reopens early.
+    function test_Limits_LoweredBelowUsageBlocksUntilDecay() public {
+        (uint256 a1, uint256 assets1) = _createOrder(user, 100e6);
+        (uint256 a2, uint256 assets2) = _createOrder(user, 10e6);
+        _setLimits(type(uint256).max, type(uint256).max, 200e6);
+        _fill(a1, assets1);
+
+        _setLimits(type(uint256).max, type(uint256).max, 40e6);
+        assertEq(ilpHelper.remainingTotalLimit(), 0);
+
+        // After 18h, 30e6 of the ~100e6 used has decayed at the new rate: still nothing left.
+        uint256 t0 = block.timestamp;
+        vm.warp(t0 + 18 hours);
+        assertEq(ilpHelper.remainingTotalLimit(), 0);
+        vm.prank(helperFiller);
+        vm.expectRevert(abi.encodeWithSelector(YuzuRedeemOrderHelper.TotalLimitExceeded.selector, assets2, 0));
+        ilpHelper.fillAndFinalizeRedeemOrder(a2, assets2, block.timestamp + 1 days);
+
+        vm.warp(t0 + 24 hours);
+        assertEq(ilpHelper.remainingTotalLimit(), 40e6);
+        _fill(a2, assets2);
+    }
+
+    function test_Limits_SetLimitsAccessAndBounds() public {
+        vm.prank(other);
+        vm.expectRevert();
+        ilpHelper.setLimits(1, 1, 1);
+
+        uint256 tooLarge = uint256(type(uint192).max) + 1;
+        vm.startPrank(admin);
+        vm.expectRevert(abi.encodeWithSelector(YuzuRedeemOrderHelper.InvalidLimit.selector, tooLarge));
+        ilpHelper.setLimits(1, tooLarge, 1);
+        vm.expectRevert(abi.encodeWithSelector(YuzuRedeemOrderHelper.InvalidLimit.selector, tooLarge));
+        ilpHelper.setLimits(1, 1, tooLarge);
+        ilpHelper.setLimits(type(uint256).max, type(uint192).max, type(uint256).max);
+        vm.stopPrank();
+    }
+
+    // --- cancel role ---------------------------------------------------------------------------
+
+    /// @dev The cancel power is its own role: `ADMIN_ROLE` alone cannot cancel, and a holder of
+    /// only `CANCEL_MANAGER_ROLE` can, with every share returned to the owner.
+    function test_CancelRole_SeparateFromAdmin() public {
+        (uint256 orderId,) = _createOrder(user, 100e6);
+        uint256 sharesAfterCreate = yzilp.balanceOf(user);
+        bytes32 cancelRole = ilpHelper.CANCEL_MANAGER_ROLE();
+        address canceller = makeAddr("canceller");
+
+        vm.prank(admin);
+        ilpHelper.revokeRole(cancelRole, admin);
+        assertTrue(ilpHelper.hasRole(ilpHelper.ADMIN_ROLE(), admin));
+        vm.prank(admin);
+        vm.expectRevert(
+            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, admin, cancelRole)
+        );
+        ilpHelper.cancelOwnRedeemOrder(orderId);
+
+        vm.prank(admin);
+        ilpHelper.grantRole(cancelRole, canceller);
+        assertFalse(ilpHelper.hasRole(ilpHelper.ADMIN_ROLE(), canceller));
+        vm.prank(canceller);
+        ilpHelper.cancelOwnRedeemOrder(orderId);
+
+        assertEq(uint256(yzilp.getRedeemOrder(orderId).status), uint256(OrderStatus.Cancelled));
+        assertGt(yzilp.balanceOf(user), sharesAfterCreate, "shares not returned to the owner");
     }
 }

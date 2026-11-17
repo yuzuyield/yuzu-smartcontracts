@@ -60,8 +60,13 @@ contract YuzuRedeemOrderHelperForkTest is Test {
         IAccessControl(YZCASH).grantRole(ORDER_FILLER_ROLE, address(helper));
 
         bytes32 fillerRole = helper.FILLER_ROLE();
-        vm.prank(admin);
+        vm.startPrank(admin);
         helper.grantRole(fillerRole, helperFiller);
+        helper.setWhitelistEnabled(false);
+        helper.grantRole(helper.LIMIT_MANAGER_ROLE(), admin);
+        helper.grantRole(helper.CANCEL_MANAGER_ROLE(), admin);
+        helper.setLimits(type(uint256).max, type(uint256).max, type(uint256).max);
+        vm.stopPrank();
 
         return true;
     }

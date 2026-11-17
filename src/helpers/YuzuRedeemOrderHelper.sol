@@ -44,8 +44,8 @@ import {Order, OrderStatus} from "../interfaces/proto/IYuzuOrderBookDefinitions.
  * - A pause landing between fill and finalize makes the whole `fillAndFinalizeRedeemOrder` call
  *   revert; this is intentional. A partially-applied state where the filler paid and the user did
  *   not receive would be strictly worse. `finalizeRedeemOrder` (permissionless) and
- *   `cancelOwnRedeemOrder` (`ADMIN_ROLE`) are the recovery paths once the pause clears or the order
- *   is abandoned.
+ *   `cancelOwnRedeemOrder` (`CANCEL_MANAGER_ROLE`) are the recovery paths once the pause clears or
+ *   the order is abandoned.
  *
  * @dev Two guards close gaps that only exist because this helper composes the vault's
  * deliberately *asynchronous* order path into a synchronous one:
@@ -63,9 +63,15 @@ import {Order, OrderStatus} from "../interfaces/proto/IYuzuOrderBookDefinitions.
  *   block; the owner cannot cancel before `dueTime`. `createRedeemOrderWithMaxFee` therefore
  *   requires a non-zero `minAssetsOut`, recorded per order and checked against the vault's own
  *   settled `order.assets` — never a pre-fill preview — on both helper payout paths: the fill
- *   (before finalize) and the finalize passthrough. Another vault `ORDER_FILLER_ROLE` holder can
- *   still fill a helper order at the vault below the floor; only helper fills honour it, so that
- *   role should be held by this helper alone.
+ *   (before finalize) and the finalize passthrough. A fill made directly at the vault by another
+ *   `ORDER_FILLER_ROLE` holder skips the floor; see **Sole vault filler** below.
+ * - **Sole vault filler (deployment requirement).** The owner floor, the whitelist and the outflow
+ *   limits bind only fills made through this helper. Any other holder of the vault's
+ *   `ORDER_FILLER_ROLE` can fill a helper order directly at the vault, bypassing all three, and can
+ *   force-cancel it. Once this helper is live on a vault, it must be the only `ORDER_FILLER_ROLE`
+ *   holder there. The code does not assume this, because existing fillers keep the role during
+ *   rollout: as a fallback, {finalizeRedeemOrder} refuses to pay out an order another filler filled
+ *   below its floor, and a force-cancelled order's fee is refunded through {settleFee}.
  *
  * @dev Access and fee:
  *
@@ -73,8 +79,19 @@ import {Order, OrderStatus} from "../interfaces/proto/IYuzuOrderBookDefinitions.
  *   appoints and removes `ADMIN_ROLE` holders and transfers itself; it has no operational function
  *   of its own, though it can appoint itself. `ADMIN_ROLE` (the operator, set at construction)
  *   runs operations and appoints the operational roles. The deployer never holds `ADMIN_ROLE`.
- * - **Who may redeem.** The vault enforces its own `REDEEMER_ROLE` allowlist on the order owner at
- *   creation and at fill; this helper adds no second list.
+ * - **Who may redeem.** Two lists, both on the order owner, and the helper's never replaces the
+ *   vault's. The vault enforces its own `REDEEMER_ROLE` allowlist (when `isRedeemRestricted`) at
+ *   creation and at fill. While `whitelistEnabled`, this helper also requires its partner list
+ *   (`isWhitelisted`, managed by `WHITELIST_MANAGER_ROLE`):
+ *   - Checked at creation and again at the helper fill, so delisting a partner also stops the fill
+ *     of their pending orders.
+ *   - Never checked on a recovery path: {finalizeRedeemOrder}, {settleFee}, {cancelOwnRedeemOrder},
+ *     and the owner's own vault cancel after `dueTime`. A delisted owner always gets either the
+ *     payout of an order already filled or the shares of one not filled; delisting never traps funds.
+ *   - On from construction (fail closed). Only `ADMIN_ROLE` can switch it, and switching keeps the
+ *     list: off opens the helper to every holder the vault allows, on restores the same partners.
+ *   - Gates who requests, not who receives: `receiver` is free, and shares are transferable, so a
+ *     listed owner can redeem shares it was sent.
  * - **Helper fee.** Charged in vault shares, and only for a redemption that happens. The fee is
  *   pulled from the owner at creation and held by this contract
  *   (`orderFeeTokens`, `totalEscrowedFeeShares`); the order is created for the remainder, so the
@@ -88,14 +105,48 @@ import {Order, OrderStatus} from "../interfaces/proto/IYuzuOrderBookDefinitions.
  *   stays permissionless, and {_settle}'s asset residual check is unchanged. Rounded down, so it
  *   never exceeds `feeBps` of `tokens`; `MAX_FEE_BPS` bounds the rate.
  * - **Pause.** `PAUSE_MANAGER_ROLE` can stop creation; only `ADMIN_ROLE` can restart it.
+ *
+ * @dev Outflow limits, set by `LIMIT_MANAGER_ROLE` and checked on every helper fill, in asset units
+ * against the vault's own settled `order.assets`. A fill that breaks one reverts whole; the order
+ * stays Pending for a later fill or a cancel. Orders consume nothing at creation, so a user cannot
+ * reserve or burn capacity without the filler paying.
+ *
+ * - **Per-fill cap** (`txCap`) on a single order's payout.
+ * - **Per-owner limit** (`accountLimit`) and **total limit** (`totalLimit`) over a rolling 24 hours,
+ *   modelled as linear refill: recorded usage decays by the current limit per `LIMIT_WINDOW` and
+ *   clears fully once `LIMIT_WINDOW` passes without a fill. The account is the vault order `owner`,
+ *   which only the owner can set (it is `msg.sender` at creation), so one user cannot spend
+ *   another's limit. Bound: no burst above the limit, and at most twice the limit in any 24 hours
+ *   (a full bucket at the start plus a full refill by the end), unlike a UTC-day reset, which
+ *   allows twice the limit within seconds of midnight.
+ * - All three default to 0 (fail closed: nothing fills until configured). `type(uint256).max`
+ *   disables a limit and stops recording usage for it. Lowering a limit below current usage blocks
+ *   fills until usage decays at the new rate; raising one takes effect at once.
+ * - The limits bind only fills through this helper; see **Sole vault filler** above.
  */
 contract YuzuRedeemOrderHelper is IYuzuRedeemOrderHelper, AccessControlDefaultAdminRules, ReentrancyGuard, Pausable {
     bytes32 public constant FILLER_ROLE = keccak256("FILLER_ROLE");
     bytes32 public constant PAUSE_MANAGER_ROLE = keccak256("PAUSE_MANAGER_ROLE");
     bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
+    bytes32 public constant WHITELIST_MANAGER_ROLE = keccak256("WHITELIST_MANAGER_ROLE");
+    bytes32 public constant LIMIT_MANAGER_ROLE = keccak256("LIMIT_MANAGER_ROLE");
+
+    /// @notice Cancels pending helper orders ({cancelOwnRedeemOrder}). Kept apart from
+    /// `ADMIN_ROLE` so the emergency cancel can sit with a fast signer while `ADMIN_ROLE` sits
+    /// behind a timelock.
+    bytes32 public constant CANCEL_MANAGER_ROLE = keccak256("CANCEL_MANAGER_ROLE");
 
     /// @notice Hard ceiling on `feeBps` (1%).
     uint16 public constant MAX_FEE_BPS = 100;
+
+    /// @notice Refill period of `accountLimit` and `totalLimit`.
+    uint256 public constant LIMIT_WINDOW = 1 days;
+
+    /// @dev Outflow recorded against a rolling limit, as of `updatedAt`.
+    struct LimitUsage {
+        uint192 used;
+        uint64 updatedAt;
+    }
 
     IYuzuProto internal immutable _vault;
     IERC20 internal immutable _asset;
@@ -121,6 +172,24 @@ contract YuzuRedeemOrderHelper is IYuzuRedeemOrderHelper, AccessControlDefaultAd
     /// @inheritdoc IYuzuRedeemOrderHelper
     address public feeRecipient;
 
+    /// @inheritdoc IYuzuRedeemOrderHelper
+    bool public whitelistEnabled;
+
+    /// @inheritdoc IYuzuRedeemOrderHelper
+    mapping(address account => bool) public isWhitelisted;
+
+    /// @inheritdoc IYuzuRedeemOrderHelper
+    uint256 public txCap;
+
+    /// @inheritdoc IYuzuRedeemOrderHelper
+    uint256 public accountLimit;
+
+    /// @inheritdoc IYuzuRedeemOrderHelper
+    uint256 public totalLimit;
+
+    mapping(address owner => LimitUsage) internal _accountUsage;
+    LimitUsage internal _totalUsage;
+
     error InvalidZeroAddress();
     error InvalidReceiver();
     error InvalidMinAssetsOut();
@@ -135,12 +204,17 @@ contract YuzuRedeemOrderHelper is IYuzuRedeemOrderHelper, AccessControlDefaultAd
     error HelperFeeAboveMax(uint256 feeBps, uint256 maxHelperFeeBps);
     error FeeNotSettleable(uint256 orderId);
     error RescueExceedsFreeBalance(uint256 amount, uint256 free);
+    error NotWhitelisted(address orderOwner);
+    error AboveTxCap(uint256 assets, uint256 txCap);
+    error AccountLimitExceeded(address orderOwner, uint256 assets, uint256 remaining);
+    error TotalLimitExceeded(uint256 assets, uint256 remaining);
+    error InvalidLimit(uint256 limit);
 
     /// @param vault_ The Yuzu V3 vault this helper is permanently bound to.
     /// @param asset_ The vault's underlying asset, checked against `vault_.asset()` below.
     /// @param admin_ Holds the two-step-transferable `DEFAULT_ADMIN_ROLE`, which only appoints
     /// `ADMIN_ROLE` holders.
-    /// @param operator_ Initial `ADMIN_ROLE` holder: fee, pause recovery, cancels, role grants.
+    /// @param operator_ Initial `ADMIN_ROLE` holder: fee, pause recovery, whitelist switch, role grants.
     // The only external call is the read-only `isUpdatingPool()` probe of the bound vault.
     // slither-disable-next-line pess-call-forward-to-protected
     constructor(address vault_, address asset_, address admin_, address operator_)
@@ -165,6 +239,12 @@ contract YuzuRedeemOrderHelper is IYuzuRedeemOrderHelper, AccessControlDefaultAd
         _grantRole(ADMIN_ROLE, operator_);
         _setRoleAdmin(FILLER_ROLE, ADMIN_ROLE);
         _setRoleAdmin(PAUSE_MANAGER_ROLE, ADMIN_ROLE);
+        _setRoleAdmin(WHITELIST_MANAGER_ROLE, ADMIN_ROLE);
+        _setRoleAdmin(LIMIT_MANAGER_ROLE, ADMIN_ROLE);
+        _setRoleAdmin(CANCEL_MANAGER_ROLE, ADMIN_ROLE);
+
+        whitelistEnabled = true;
+        emit UpdatedWhitelistEnabled(true);
     }
 
     /// @inheritdoc IYuzuRedeemOrderHelper
@@ -180,6 +260,7 @@ contract YuzuRedeemOrderHelper is IYuzuRedeemOrderHelper, AccessControlDefaultAd
         _checkOrderTerms(receiver, minAssetsOut);
         address orderOwner = _msgSender();
         _requireVaultSettlementOpen(orderOwner);
+        _checkWhitelisted(orderOwner);
         _checkHelperFee(maxHelperFeeBps);
         uint256 feeTokens = _feeFor(tokens);
         if (feeTokens != 0) {
@@ -214,9 +295,11 @@ contract YuzuRedeemOrderHelper is IYuzuRedeemOrderHelper, AccessControlDefaultAd
             revert OrderNotControlledByHelper(orderId, order.controller);
         }
         _requireVaultSettlementOpen(order.owner);
+        _checkWhitelisted(order.owner);
 
         uint256 entryBalance = _asset.balanceOf(address(this));
         uint256 settled = _settle(orderId, maxAssets, orderMinAssetsOut[orderId], entryBalance);
+        _consumeLimits(order.owner, settled);
         _settleFee(orderId);
 
         emit FilledAndFinalizedRedeemOrder(orderId, order.owner, order.receiver, maxAssets, settled);
@@ -225,9 +308,10 @@ contract YuzuRedeemOrderHelper is IYuzuRedeemOrderHelper, AccessControlDefaultAd
     /// @inheritdoc IYuzuRedeemOrderHelper
     // slither-disable-next-line reentrancy-benign
     function finalizeRedeemOrder(uint256 orderId) external nonReentrant {
-        // An order another vault filler filled below the owner's floor is not paid out through this
-        // helper; its owner can still finalize it directly at the vault. Other states fall through
-        // to the vault's own checks.
+        // Fallback for the sole-filler requirement (see the contract note): an order another vault
+        // filler filled below the owner's floor is not paid out through this helper. Its owner can
+        // still accept it by finalizing directly at the vault. Other states fall through to the
+        // vault's own checks.
         Order memory order = _vault.getRedeemOrder(orderId);
         if (order.status == OrderStatus.Filled && order.assets < orderMinAssetsOut[orderId]) {
             revert MinAssetsOutNotMet(order.assets, orderMinAssetsOut[orderId]);
@@ -239,7 +323,7 @@ contract YuzuRedeemOrderHelper is IYuzuRedeemOrderHelper, AccessControlDefaultAd
     /// @inheritdoc IYuzuRedeemOrderHelper
     // slither-disable-next-line reentrancy-benign
     function cancelOwnRedeemOrder(uint256 orderId) external nonReentrant {
-        _checkRole(ADMIN_ROLE);
+        _checkRole(CANCEL_MANAGER_ROLE);
         Order memory order = _vault.getRedeemOrder(orderId);
         if (order.controller != address(this)) {
             revert OrderNotControlledByHelper(orderId, order.controller);
@@ -287,6 +371,43 @@ contract YuzuRedeemOrderHelper is IYuzuRedeemOrderHelper, AccessControlDefaultAd
         emit UpdatedFee(newFeeBps, newFeeRecipient);
     }
 
+    /// @notice Adds or removes partners from the helper whitelist. Removal also blocks the fill of
+    /// any of their orders still pending.
+    // Guarded by `_checkRole(WHITELIST_MANAGER_ROLE)` in the body.
+    // slither-disable-next-line pess-unprotected-setter
+    function setWhitelisted(address[] calldata accounts, bool allowed) external {
+        _checkRole(WHITELIST_MANAGER_ROLE);
+        for (uint256 i = 0; i < accounts.length; ++i) {
+            isWhitelisted[accounts[i]] = allowed;
+            emit UpdatedWhitelisted(accounts[i], allowed);
+        }
+    }
+
+    /// @notice Turns the helper whitelist on or off. Off opens the helper to every holder the vault
+    /// itself allows to redeem, so it is reserved to `ADMIN_ROLE`.
+    // Guarded by `_checkRole(ADMIN_ROLE)` in the body.
+    // slither-disable-next-line pess-unprotected-setter
+    function setWhitelistEnabled(bool enabled) external {
+        _checkRole(ADMIN_ROLE);
+        whitelistEnabled = enabled;
+        emit UpdatedWhitelistEnabled(enabled);
+    }
+
+    /// @notice Sets the per-fill cap and the rolling 24h per-owner and total limits, in asset units.
+    /// `type(uint256).max` disables a limit; a rolling limit is otherwise capped at
+    /// `type(uint192).max` so its usage always fits the packed slot.
+    // Guarded by `_checkRole(LIMIT_MANAGER_ROLE)` in the body.
+    // slither-disable-next-line pess-unprotected-setter
+    function setLimits(uint256 newTxCap, uint256 newAccountLimit, uint256 newTotalLimit) external {
+        _checkRole(LIMIT_MANAGER_ROLE);
+        _checkRollingLimit(newAccountLimit);
+        _checkRollingLimit(newTotalLimit);
+        txCap = newTxCap;
+        accountLimit = newAccountLimit;
+        totalLimit = newTotalLimit;
+        emit UpdatedLimits(newTxCap, newAccountLimit, newTotalLimit);
+    }
+
     /// @notice Recovers tokens sent to this contract by mistake or as a donation. Never required
     /// for correct operation: settlement's delta accounting already tolerates stray balances.
     /// Escrowed helper fees (vault shares) are owed to owners or `feeRecipient` and cannot be taken.
@@ -314,6 +435,16 @@ contract YuzuRedeemOrderHelper is IYuzuRedeemOrderHelper, AccessControlDefaultAd
     /// @inheritdoc IYuzuRedeemOrderHelper
     function vaultExposesPoolUpdateFlag() external view returns (bool) {
         return _vaultExposesPoolUpdateFlag;
+    }
+
+    /// @inheritdoc IYuzuRedeemOrderHelper
+    function remainingAccountLimit(address orderOwner) external view returns (uint256) {
+        return _remaining(_accountUsage[orderOwner], accountLimit);
+    }
+
+    /// @inheritdoc IYuzuRedeemOrderHelper
+    function remainingTotalLimit() external view returns (uint256) {
+        return _remaining(_totalUsage, totalLimit);
     }
 
     /// @dev Reverts while the bound vault has a price restatement staged, so no order can be
@@ -353,6 +484,72 @@ contract YuzuRedeemOrderHelper is IYuzuRedeemOrderHelper, AccessControlDefaultAd
     /// `feeBps` of `tokens`.
     function _feeFor(uint256 tokens) internal view returns (uint256) {
         return Math.mulDiv(tokens, feeBps, 10_000);
+    }
+
+    function _checkWhitelisted(address orderOwner) internal view {
+        if (whitelistEnabled && !isWhitelisted[orderOwner]) {
+            revert NotWhitelisted(orderOwner);
+        }
+    }
+
+    function _checkRollingLimit(uint256 limit) internal pure {
+        if (limit != type(uint256).max && limit > type(uint192).max) {
+            revert InvalidLimit(limit);
+        }
+    }
+
+    /// @dev Enforces all three outflow limits on a settled payout and records it against the two
+    /// rolling ones. A disabled (`type(uint256).max`) rolling limit is skipped without a write.
+    function _consumeLimits(address orderOwner, uint256 assets) internal {
+        uint256 cap = txCap;
+        if (assets > cap) {
+            revert AboveTxCap(assets, cap);
+        }
+        uint256 limit = accountLimit;
+        if (limit != type(uint256).max) {
+            uint256 remaining = _consume(_accountUsage[orderOwner], limit, assets);
+            if (assets > remaining) {
+                revert AccountLimitExceeded(orderOwner, assets, remaining);
+            }
+        }
+        limit = totalLimit;
+        if (limit != type(uint256).max) {
+            uint256 remaining = _consume(_totalUsage, limit, assets);
+            if (assets > remaining) {
+                revert TotalLimitExceeded(assets, remaining);
+            }
+        }
+    }
+
+    /// @dev Returns the capacity before this fill and records the fill only when it fits. The
+    /// stored sum stays at or under `limit`, itself at most `type(uint192).max`, so the cast is exact.
+    function _consume(LimitUsage storage usage, uint256 limit, uint256 assets) internal returns (uint256 remaining) {
+        uint256 used = _usedNow(usage, limit);
+        remaining = limit > used ? limit - used : 0;
+        if (assets <= remaining) {
+            usage.used = uint192(used + assets);
+            usage.updatedAt = uint64(block.timestamp);
+        }
+    }
+
+    function _remaining(LimitUsage storage usage, uint256 limit) internal view returns (uint256) {
+        if (limit == type(uint256).max) {
+            return limit;
+        }
+        uint256 used = _usedNow(usage, limit);
+        return limit > used ? limit - used : 0;
+    }
+
+    /// @dev Usage decays linearly by `limit` per `LIMIT_WINDOW` and clears once a full window
+    /// passes with no fill, which also drops usage left above a since-lowered limit.
+    function _usedNow(LimitUsage storage usage, uint256 limit) internal view returns (uint256) {
+        LimitUsage memory snapshot = usage;
+        uint256 elapsed = block.timestamp - snapshot.updatedAt;
+        if (elapsed >= LIMIT_WINDOW) {
+            return 0;
+        }
+        uint256 decay = Math.mulDiv(limit, elapsed, LIMIT_WINDOW);
+        return snapshot.used > decay ? snapshot.used - decay : 0;
     }
 
     /// @dev Resolves an escrowed fee from the vault's order status. No-op when nothing is escrowed

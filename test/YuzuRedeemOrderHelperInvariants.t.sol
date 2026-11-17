@@ -53,6 +53,7 @@ contract YuzuRedeemOrderHelperInvariantHandler is CommonBase, StdCheats, StdUtil
     bool public earlyFeeSettleObserved; // I2d
     uint256 public unexpectedFinalizeFailures; // I6
     uint256 public unexpectedUserCancelFailures; // I6
+    bool public gatedOwnerServedObserved; // I10
     uint256 public unexpectedSettleFeeFailures; // I2c
 
     // --- reachability counters (diagnostics, never asserted) -------------------------------------
@@ -64,6 +65,7 @@ contract YuzuRedeemOrderHelperInvariantHandler is CommonBase, StdCheats, StdUtil
     uint256 public finalizedViaHelperCount;
     uint256 public finalizedAtVaultCount;
     uint256 public userCancelCount;
+    uint256 public whitelistBlockedCount;
     uint256 public adminCancelCount;
     uint256 public settleFeeCount;
 
@@ -91,9 +93,11 @@ contract YuzuRedeemOrderHelperInvariantHandler is CommonBase, StdCheats, StdUtil
         vm.prank(helperFiller);
         asset_.approve(address(helper_), type(uint256).max);
 
+        address[] memory partners = new address[](NUM_ACTORS);
         for (uint256 i = 0; i < NUM_ACTORS; i++) {
             address a = makeAddr(string.concat("invariantActor", vm.toString(i)));
             actors[i] = a;
+            partners[i] = a;
 
             asset_.mint(a, 1_000_000e6);
             vm.prank(a);
@@ -104,6 +108,14 @@ contract YuzuRedeemOrderHelperInvariantHandler is CommonBase, StdCheats, StdUtil
             vault_.deposit(INITIAL_DEPOSIT, a);
         }
 
+        // The helper starts as deployed (whitelist on); every actor starts listed, and the
+        // `setWhitelisted` / `setWhitelistEnabled` actions churn both from there.
+        bytes32 listRole = helper_.WHITELIST_MANAGER_ROLE();
+        vm.startPrank(admin_);
+        helper_.grantRole(listRole, admin_);
+        helper_.setWhitelisted(partners, true);
+        vm.stopPrank();
+
         asset_.mint(outsider_, 1_000_000e6);
         vm.prank(outsider_);
         asset_.approve(address(helper_), type(uint256).max);
@@ -113,6 +125,11 @@ contract YuzuRedeemOrderHelperInvariantHandler is CommonBase, StdCheats, StdUtil
 
     function _actor(uint256 seed) internal view returns (address) {
         return actors[_bound(seed, 0, NUM_ACTORS - 1)];
+    }
+
+    /// @dev True when the helper must refuse `owner` right now: list on and owner not on it.
+    function _gated(address owner) internal view returns (bool) {
+        return helper.whitelistEnabled() && !helper.isWhitelisted(owner);
     }
 
     // --- views for the outer invariant contract --------------------------------------------------
@@ -145,13 +162,18 @@ contract YuzuRedeemOrderHelperInvariantHandler is CommonBase, StdCheats, StdUtil
         uint256 tokens = _bound(tokensSeed, 1, shareBal);
         uint256 maxHelperFeeBps = helper.MAX_FEE_BPS();
 
+        bool gated = _gated(a);
+
         vm.prank(a);
         try helper.createRedeemOrderWithMaxFee(tokens, a, 1_000_000, maxHelperFeeBps, 1) returns (uint256 orderId) {
+            if (gated) gatedOwnerServedObserved = true;
             _expectedOwner[orderId] = a;
             helperOrderIds.push(orderId);
             createdViaHelperCount++;
             if (helper.orderFeeTokens(orderId) != 0) createdWithFeeCount++;
-        } catch {}
+        } catch {
+            if (gated) whitelistBlockedCount++;
+        }
     }
 
     /// @dev A user creates a redeem order DIRECTLY on the vault, bypassing the helper entirely --
@@ -180,13 +202,17 @@ contract YuzuRedeemOrderHelperInvariantHandler is CommonBase, StdCheats, StdUtil
         uint256 maxAssets = type(uint128).max;
         asset.mint(helperFiller, maxAssets);
         uint256 receiverBalBefore = asset.balanceOf(order.receiver);
+        bool gated = _gated(order.owner);
 
         vm.prank(helperFiller);
         try helper.fillAndFinalizeRedeemOrder(orderId, maxAssets, block.timestamp + 1 days) {
+            if (gated) gatedOwnerServedObserved = true;
             assetsSettledAccordingToVault += vault.getRedeemOrder(orderId).assets;
             actualAssetsDeliveredToReceivers += asset.balanceOf(order.receiver) - receiverBalBefore;
             helperFillCount++;
-        } catch {}
+        } catch {
+            if (gated) whitelistBlockedCount++;
+        }
     }
 
     /// @dev `outsider` never holds `FILLER_ROLE` anywhere. I4: this must never move an asset.
@@ -368,6 +394,19 @@ contract YuzuRedeemOrderHelperInvariantHandler is CommonBase, StdCheats, StdUtil
         vm.stopPrank();
     }
 
+    /// @dev The list manager adds or removes one actor, including one with orders in flight.
+    function setWhitelisted(uint256 actorSeed, bool allowed) external {
+        address[] memory accounts = new address[](1);
+        accounts[0] = _actor(actorSeed);
+        vm.prank(admin);
+        helper.setWhitelisted(accounts, allowed);
+    }
+
+    function setWhitelistEnabled(bool enabled) external {
+        vm.prank(admin);
+        helper.setWhitelistEnabled(enabled);
+    }
+
     function warp(uint256 secondsForward) external {
         vm.warp(block.timestamp + _bound(secondsForward, 0, 3 days));
     }
@@ -399,6 +438,9 @@ contract YuzuRedeemOrderHelperInvariantTest is YuzuV3TestBase {
         vm.startPrank(admin);
         yzilp.grantRole(ORDER_FILLER_ROLE, address(helper));
         helper.grantRole(helper.PAUSE_MANAGER_ROLE(), admin);
+        helper.grantRole(helper.LIMIT_MANAGER_ROLE(), admin);
+        helper.grantRole(helper.CANCEL_MANAGER_ROLE(), admin);
+        helper.setLimits(type(uint256).max, type(uint256).max, type(uint256).max);
         vm.stopPrank();
 
         vm.prank(vaultFiller);
@@ -492,5 +534,12 @@ contract YuzuRedeemOrderHelperInvariantTest is YuzuV3TestBase {
             handler.assetsSettledAccordingToVault(),
             "! assetsDelivered == assetsSettledAccordingToVault"
         );
+    }
+
+    /// I10 -- while the whitelist is on, the helper never creates or fills an order for an owner
+    /// off the list, however the list and the switch were churned around orders in flight. I6
+    /// above runs over the same churn, so delisting never blocks finalize or the owner's cancel.
+    function invariantTest_I10_WhitelistGatesCreateAndFill() public view {
+        assertFalse(handler.gatedOwnerServedObserved(), "! helper served an owner off the whitelist");
     }
 }

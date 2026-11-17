@@ -42,10 +42,20 @@ interface IYuzuRedeemOrderHelper {
     /// cancelled, or no fee recipient is set when it settles.
     event RefundedFee(uint256 indexed orderId, address indexed owner, uint256 feeTokens);
 
+    /// @notice Emitted when an account is added to or removed from the helper whitelist.
+    event UpdatedWhitelisted(address indexed account, bool allowed);
+
+    /// @notice Emitted when the helper whitelist is turned on or off.
+    event UpdatedWhitelistEnabled(bool enabled);
+
+    /// @notice Emitted when the per-fill cap or the rolling 24h limits change.
+    event UpdatedLimits(uint256 txCap, uint256 accountLimit, uint256 totalLimit);
+
     /// @notice Creates a redeem order with `owner = msg.sender` and `controller = address(this)`,
     /// forwarding to the vault's own max-fee check (the vault also enforces its `REDEEMER_ROLE`
-    /// allowlist on the owner). The helper fee is pulled from the caller's shares now and held in
-    /// escrow (the order is for `tokens` minus it); see {settleFee}.
+    /// allowlist on the owner). While `whitelistEnabled`, the caller must be `isWhitelisted`, else
+    /// `NotWhitelisted`; the same check runs again at fill. The helper fee is pulled from the
+    /// caller's shares now and held in escrow (the order is for `tokens` minus it); see {settleFee}.
     /// @param tokens Vault shares to redeem, gross of the helper fee.
     /// @param receiver Address to receive the settled assets on finalize. May not be the helper:
     /// a self-referential receiver makes the settlement path's residual-balance equality
@@ -68,7 +78,11 @@ interface IYuzuRedeemOrderHelper {
     ) external returns (uint256 orderId);
 
     /// @notice Fills and finalizes a pending order the helper controls in one transaction, pulling
-    /// at most `maxAssets` from the caller and refunding any unused amount.
+    /// at most `maxAssets` from the caller and refunding any unused amount. While `whitelistEnabled`,
+    /// reverts `NotWhitelisted` if the order owner has been delisted since creation. The settled
+    /// payout must fit `txCap`, the owner's remaining `accountLimit` and the remaining `totalLimit`,
+    /// else it reverts `AboveTxCap`, `AccountLimitExceeded` or `TotalLimitExceeded`. On any of these
+    /// the order stays Pending.
     /// @param orderId The vault's order id.
     /// @param maxAssets Upper bound on the assets the caller is willing to pay; the caller's own
     /// slippage guard against a fee change or NAV move since order creation.
@@ -82,9 +96,10 @@ interface IYuzuRedeemOrderHelper {
     /// a staged restatement: it pays only the amount fixed at fill.
     function finalizeRedeemOrder(uint256 orderId) external;
 
-    /// @notice Cancels a pending order the helper created, refusing every other order. This is the
-    /// only reachable cancel path — see the contract-level note on why an unrestricted passthrough
-    /// is never exposed.
+    /// @notice Cancels a pending order the helper created, refusing every other order; restricted to
+    /// `CANCEL_MANAGER_ROLE`. The vault returns the order's shares to the owner and the escrowed
+    /// helper fee is refunded inline. This is the only reachable cancel path — see the
+    /// contract-level note on why an unrestricted passthrough is never exposed.
     function cancelOwnRedeemOrder(uint256 orderId) external;
 
     /// @notice Resolves the escrowed helper fee of a two-transaction order from the vault's order
@@ -118,4 +133,28 @@ interface IYuzuRedeemOrderHelper {
     /// @notice True when the bound vault is a yzILP-family vault, whose price-restatement freeze
     /// is read from `isUpdatingPool()`. False for the yzUSD family, read from `canRedeem`.
     function vaultExposesPoolUpdateFlag() external view returns (bool);
+
+    /// @notice True while only `isWhitelisted` owners may create or be filled through the helper.
+    /// On from construction.
+    function whitelistEnabled() external view returns (bool);
+
+    /// @notice Whether `account` is on the helper's partner whitelist.
+    function isWhitelisted(address account) external view returns (bool);
+
+    /// @notice Largest single payout, in asset units, a helper fill may settle. 0 blocks every fill.
+    function txCap() external view returns (uint256);
+
+    /// @notice Assets one order owner may receive through helper fills per rolling 24 hours.
+    /// `type(uint256).max` disables it; 0 blocks every fill.
+    function accountLimit() external view returns (uint256);
+
+    /// @notice Assets all owners together may receive through helper fills per rolling 24 hours.
+    /// `type(uint256).max` disables it; 0 blocks every fill.
+    function totalLimit() external view returns (uint256);
+
+    /// @notice Capacity `owner` has left under `accountLimit` now; `type(uint256).max` if disabled.
+    function remainingAccountLimit(address owner) external view returns (uint256);
+
+    /// @notice Capacity left under `totalLimit` now; `type(uint256).max` if disabled.
+    function remainingTotalLimit() external view returns (uint256);
 }
