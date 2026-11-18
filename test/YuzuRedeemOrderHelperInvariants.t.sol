@@ -438,6 +438,7 @@ contract YuzuRedeemOrderHelperInvariantTest is YuzuV3TestBase {
         vm.startPrank(admin);
         yzilp.grantRole(ORDER_FILLER_ROLE, address(helper));
         helper.grantRole(helper.PAUSE_MANAGER_ROLE(), admin);
+        helper.grantRole(helper.UNPAUSE_MANAGER_ROLE(), admin);
         helper.grantRole(helper.LIMIT_MANAGER_ROLE(), admin);
         helper.grantRole(helper.CANCEL_MANAGER_ROLE(), admin);
         helper.setLimits(type(uint256).max, type(uint256).max, type(uint256).max);

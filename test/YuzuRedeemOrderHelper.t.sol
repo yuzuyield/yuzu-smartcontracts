@@ -141,6 +141,8 @@ contract YuzuRedeemOrderHelperTest is YuzuV3TestBase {
         usdHelper.grantRole(usdHelper.FILLER_ROLE(), helperFiller);
         ilpHelper.grantRole(ilpHelper.PAUSE_MANAGER_ROLE(), admin);
         usdHelper.grantRole(usdHelper.PAUSE_MANAGER_ROLE(), admin);
+        ilpHelper.grantRole(ilpHelper.UNPAUSE_MANAGER_ROLE(), admin);
+        usdHelper.grantRole(usdHelper.UNPAUSE_MANAGER_ROLE(), admin);
         ilpHelper.setWhitelistEnabled(false);
         usdHelper.setWhitelistEnabled(false);
         ilpHelper.grantRole(ilpHelper.LIMIT_MANAGER_ROLE(), admin);
@@ -482,23 +484,55 @@ contract YuzuRedeemOrderHelperTest is YuzuV3TestBase {
 
     function test_PauseSplit_PauserCannotUnpause() public {
         address pauser = makeAddr("pauser");
+        address unpauser = makeAddr("unpauser");
         bytes32 pauseRole = ilpHelper.PAUSE_MANAGER_ROLE();
-        bytes32 adminRole = ilpHelper.ADMIN_ROLE();
-        vm.prank(admin);
+        bytes32 unpauseRole = ilpHelper.UNPAUSE_MANAGER_ROLE();
+        vm.startPrank(admin);
         ilpHelper.grantRole(pauseRole, pauser);
+        ilpHelper.grantRole(unpauseRole, unpauser);
+        vm.stopPrank();
 
         vm.prank(pauser);
         ilpHelper.pause();
 
         vm.prank(pauser);
         vm.expectRevert(
-            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, pauser, adminRole)
+            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, pauser, unpauseRole)
         );
         ilpHelper.unpause();
 
-        vm.prank(admin);
+        vm.prank(unpauser);
         ilpHelper.unpause();
         assertFalse(ilpHelper.paused());
+    }
+
+    function test_PauseSplit_UnpauserCannotPause_AdminAloneCannotUnpause() public {
+        address unpauser = makeAddr("unpauser");
+        address operator = makeAddr("operator");
+        bytes32 pauseRole = ilpHelper.PAUSE_MANAGER_ROLE();
+        bytes32 unpauseRole = ilpHelper.UNPAUSE_MANAGER_ROLE();
+        bytes32 adminRole = ilpHelper.ADMIN_ROLE();
+        vm.startPrank(admin);
+        ilpHelper.grantRole(unpauseRole, unpauser);
+        ilpHelper.grantRole(adminRole, operator);
+        vm.stopPrank();
+
+        vm.prank(unpauser);
+        vm.expectRevert(
+            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, unpauser, pauseRole)
+        );
+        ilpHelper.pause();
+
+        vm.prank(admin);
+        ilpHelper.pause();
+
+        // ADMIN_ROLE administers UNPAUSE_MANAGER_ROLE but does not hold it.
+        vm.prank(operator);
+        vm.expectRevert(
+            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, operator, unpauseRole)
+        );
+        ilpHelper.unpause();
+        assertEq(ilpHelper.getRoleAdmin(unpauseRole), adminRole);
     }
 
     /// @dev The helper has no allowlist of its own: the vault's REDEEMER_ROLE is the only owner gate.

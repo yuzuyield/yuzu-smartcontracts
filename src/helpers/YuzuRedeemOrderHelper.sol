@@ -104,7 +104,9 @@ import {Order, OrderStatus} from "../interfaces/proto/IYuzuOrderBookDefinitions.
  *   asset, so `receiver` stays the user, finalize
  *   stays permissionless, and {_settle}'s asset residual check is unchanged. Rounded down, so it
  *   never exceeds `feeBps` of `tokens`; `MAX_FEE_BPS` bounds the rate.
- * - **Pause.** `PAUSE_MANAGER_ROLE` can stop creation; only `ADMIN_ROLE` can restart it.
+ * - **Pause.** `PAUSE_MANAGER_ROLE` can stop creation; only `UNPAUSE_MANAGER_ROLE` can restart it.
+ *   The two are separate roles so a pauser (ops signer, monitoring bot) can stop the helper but
+ *   never re-open it, and re-opening can sit with a slower signer.
  *
  * @dev Outflow limits, set by `LIMIT_MANAGER_ROLE` and checked on every helper fill, in asset units
  * against the vault's own settled `order.assets`. A fill that breaks one reverts whole; the order
@@ -127,6 +129,7 @@ import {Order, OrderStatus} from "../interfaces/proto/IYuzuOrderBookDefinitions.
 contract YuzuRedeemOrderHelper is IYuzuRedeemOrderHelper, AccessControlDefaultAdminRules, ReentrancyGuard, Pausable {
     bytes32 public constant FILLER_ROLE = keccak256("FILLER_ROLE");
     bytes32 public constant PAUSE_MANAGER_ROLE = keccak256("PAUSE_MANAGER_ROLE");
+    bytes32 public constant UNPAUSE_MANAGER_ROLE = keccak256("UNPAUSE_MANAGER_ROLE");
     bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
     bytes32 public constant WHITELIST_MANAGER_ROLE = keccak256("WHITELIST_MANAGER_ROLE");
     bytes32 public constant LIMIT_MANAGER_ROLE = keccak256("LIMIT_MANAGER_ROLE");
@@ -214,7 +217,7 @@ contract YuzuRedeemOrderHelper is IYuzuRedeemOrderHelper, AccessControlDefaultAd
     /// @param asset_ The vault's underlying asset, checked against `vault_.asset()` below.
     /// @param admin_ Holds the two-step-transferable `DEFAULT_ADMIN_ROLE`, which only appoints
     /// `ADMIN_ROLE` holders.
-    /// @param operator_ Initial `ADMIN_ROLE` holder: fee, pause recovery, whitelist switch, role grants.
+    /// @param operator_ Initial `ADMIN_ROLE` holder: fee, whitelist switch, rescue, role grants.
     // The only external call is the read-only `isUpdatingPool()` probe of the bound vault.
     // slither-disable-next-line pess-call-forward-to-protected
     constructor(address vault_, address asset_, address admin_, address operator_)
@@ -239,6 +242,7 @@ contract YuzuRedeemOrderHelper is IYuzuRedeemOrderHelper, AccessControlDefaultAd
         _grantRole(ADMIN_ROLE, operator_);
         _setRoleAdmin(FILLER_ROLE, ADMIN_ROLE);
         _setRoleAdmin(PAUSE_MANAGER_ROLE, ADMIN_ROLE);
+        _setRoleAdmin(UNPAUSE_MANAGER_ROLE, ADMIN_ROLE);
         _setRoleAdmin(WHITELIST_MANAGER_ROLE, ADMIN_ROLE);
         _setRoleAdmin(LIMIT_MANAGER_ROLE, ADMIN_ROLE);
         _setRoleAdmin(CANCEL_MANAGER_ROLE, ADMIN_ROLE);
@@ -344,10 +348,10 @@ contract YuzuRedeemOrderHelper is IYuzuRedeemOrderHelper, AccessControlDefaultAd
         _pause();
     }
 
-    /// @notice Restarting is reserved to `ADMIN_ROLE`, so a pauser (ops signer, monitoring bot)
-    /// can stop the helper but never re-open it.
+    /// @notice Restarting is reserved to `UNPAUSE_MANAGER_ROLE`, separate from
+    /// `PAUSE_MANAGER_ROLE`, so a pauser can stop the helper but never re-open it.
     function unpause() external {
-        _checkRole(ADMIN_ROLE);
+        _checkRole(UNPAUSE_MANAGER_ROLE);
         _unpause();
     }
 
