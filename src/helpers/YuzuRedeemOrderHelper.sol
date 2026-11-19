@@ -3,6 +3,7 @@ pragma solidity ^0.8.30;
 
 import {AccessControlDefaultAdminRules} from
     "@openzeppelin/contracts/access/extensions/AccessControlDefaultAdminRules.sol";
+import {IAccessControl} from "@openzeppelin/contracts/access/IAccessControl.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {SafeERC20, IERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -10,16 +11,18 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 import {IYuzuRedeemOrderHelper} from "../interfaces/IYuzuRedeemOrderHelper.sol";
 import {IYuzuILPV2} from "../interfaces/IYuzuILP.sol";
-import {IYuzuProto, IYuzuProtoV2} from "../interfaces/proto/IYuzuProto.sol";
+import {IYuzuILPV3Router} from "../interfaces/IYuzuV3FacetRouters.sol";
+import {IYuzuProto} from "../interfaces/proto/IYuzuProto.sol";
 import {Order, OrderStatus} from "../interfaces/proto/IYuzuOrderBookDefinitions.sol";
 
 /**
  * @title YuzuRedeemOrderHelper
- * @notice Sits beside a single, immutable Yuzu V3 vault. A user creates a redeem order through
+ * @notice Sits beside a single, immutable yzILP V3 vault. A user creates a redeem order through
  * this helper (one `approve` + one call), which records the helper as the order `controller`. A
  * permissioned filler can then fill and finalize the order in one transaction — the user never
  * returns. No vault code is modified; the helper only holds `ORDER_FILLER_ROLE` on the vault and
- * calls its existing, unmodified order-book surface.
+ * calls its existing, unmodified order-book surface. Only yzILP V3 is supported: the constructor
+ * reverts on a vault without `isUpdatingPool()` and `highWaterMark()`.
  *
  * @dev Custody and settlement invariants, all load-bearing:
  *
@@ -35,7 +38,7 @@ import {Order, OrderStatus} from "../interfaces/proto/IYuzuOrderBookDefinitions.
  *   from the vault's own balance, so a self-referential receiver credits this contract mid-call
  *   and makes the closing residual-balance equality unsatisfiable for every possible `maxAssets` —
  *   bricking the order's only fill path — while a vault-level force-fill would strand the payout
- *   here as un-owned balance. Rejected at both creation sites instead.
+ *   here as un-owned balance. Rejected at creation instead (see {_checkOrderTerms}).
  * - `ORDER_FILLER_ROLE` on the vault also confers unconditional force-cancel of any pending order,
  *   bypassing the vault's pause check, its owner/controller check, and `dueTime` together. The
  *   only cancel path this contract exposes is `cancelOwnRedeemOrder`, which refuses every order
@@ -50,15 +53,11 @@ import {Order, OrderStatus} from "../interfaces/proto/IYuzuOrderBookDefinitions.
  * @dev Two guards close gaps that only exist because this helper composes the vault's
  * deliberately *asynchronous* order path into a synchronous one:
  *
- * - **Restatement gate.** Both V3 vault families freeze their instant redeem path while a price
- *   restatement is staged — yzUSD through `canRedeem`, which folds in the NAV-update flag, and
- *   yzILP through `isUpdatingPool`. Neither freeze reaches `canCreateRedeemOrder`,
- *   `fillRedeemOrder` or `finalizeRedeemOrder`, because the order path was assumed slow enough
- *   that no holder could exit at the pre-restatement price. This helper deletes that assumption,
- *   so it re-imposes the freeze itself, in {_requireVaultSettlementOpen}. The two families expose
- *   the flag differently and `YuzuILPV2.canRedeem` is hardcoded `false` (ILP has no instant redeem
- *   path at all), so the predicate is selected once, at construction, by probing for
- *   `isUpdatingPool()`.
+ * - **Restatement gate.** yzILP freezes pricing while a pool restatement is staged
+ *   (`isUpdatingPool`), but that freeze never reaches `canCreateRedeemOrder`, `fillRedeemOrder`
+ *   or `finalizeRedeemOrder`, because the order path was assumed slow enough that no holder could
+ *   exit at the pre-restatement price. This helper deletes that assumption, so it re-imposes the
+ *   freeze itself, in {_requireVaultSettlementOpen}.
  * - **Owner price floor.** `fillRedeemOrder` prices at the fill block, and the filler picks that
  *   block; the owner cannot cancel before `dueTime`. `createRedeemOrderWithMaxFee` therefore
  *   requires a non-zero `minAssetsOut`, recorded per order and checked against the vault's own
@@ -125,6 +124,18 @@ import {Order, OrderStatus} from "../interfaces/proto/IYuzuOrderBookDefinitions.
  *   disables a limit and stops recording usage for it. Lowering a limit below current usage blocks
  *   fills until usage decays at the new rate; raising one takes effect at once.
  * - The limits bind only fills through this helper; see **Sole vault filler** above.
+ *
+ * @dev Slippage guard, set by `LIMIT_MANAGER_ROLE` via {setMaxSlippage} (`maxSlippageBps`,
+ * 0 = off). At creation the helper records the vault's own quote for the order
+ * (`orderExpectedAssets`), exact in that transaction because the order's fee is stamped in it; a
+ * zero quote is rejected. A helper fill then reverts if the settled payout moves more than
+ * `maxSlippageBps` from the quote in either direction (bands round up). The band is flat: it does
+ * not widen with order age. Size it above the largest legitimate price move within the vault's
+ * `fillWindow` (linear yield, a distribution, a restatement); a larger move blocks helper fills of
+ * older orders until `LIMIT_MANAGER_ROLE` widens the band, `CANCEL_MANAGER_ROLE` cancels, or the
+ * owner cancels at the vault after `dueTime`. The guard bounds price movement between creation
+ * and fill only; it does not judge whether the vault price is right. Like the limits, it binds
+ * only fills through this helper.
  */
 contract YuzuRedeemOrderHelper is IYuzuRedeemOrderHelper, AccessControlDefaultAdminRules, ReentrancyGuard, Pausable {
     bytes32 public constant FILLER_ROLE = keccak256("FILLER_ROLE");
@@ -145,6 +156,12 @@ contract YuzuRedeemOrderHelper is IYuzuRedeemOrderHelper, AccessControlDefaultAd
     /// @notice Refill period of `accountLimit` and `totalLimit`.
     uint256 public constant LIMIT_WINDOW = 1 days;
 
+    /// @notice Hard ceiling on `maxSlippageBps` (20%).
+    uint16 public constant MAX_SLIPPAGE_BPS = 2_000;
+
+    /// @dev The vault's order-filler role, which the helper must hold to fill and force-cancel.
+    bytes32 internal constant VAULT_ORDER_FILLER_ROLE = keccak256("ORDER_FILLER_ROLE");
+
     /// @dev Outflow recorded against a rolling limit, as of `updatedAt`.
     struct LimitUsage {
         uint192 used;
@@ -153,12 +170,6 @@ contract YuzuRedeemOrderHelper is IYuzuRedeemOrderHelper, AccessControlDefaultAd
 
     IYuzuProto internal immutable _vault;
     IERC20 internal immutable _asset;
-
-    /// @dev True when the bound vault answers `isUpdatingPool()` — the yzILP family. False for the
-    /// yzUSD family, whose restatement freeze is reachable only through `canRedeem`. Probed once,
-    /// at construction, because the two families expose no common predicate: `canRedeem` is
-    /// hardcoded `false` on every yzILP vault, and `isUpdatingPool()` does not exist on yzUSD.
-    bool internal immutable _vaultExposesPoolUpdateFlag;
 
     /// @inheritdoc IYuzuRedeemOrderHelper
     mapping(uint256 orderId => uint256 minAssetsOut) public orderMinAssetsOut;
@@ -190,6 +201,12 @@ contract YuzuRedeemOrderHelper is IYuzuRedeemOrderHelper, AccessControlDefaultAd
     /// @inheritdoc IYuzuRedeemOrderHelper
     uint256 public totalLimit;
 
+    /// @inheritdoc IYuzuRedeemOrderHelper
+    uint16 public maxSlippageBps;
+
+    /// @inheritdoc IYuzuRedeemOrderHelper
+    mapping(uint256 orderId => uint256 assets) public orderExpectedAssets;
+
     mapping(address owner => LimitUsage) internal _accountUsage;
     LimitUsage internal _totalUsage;
 
@@ -212,13 +229,17 @@ contract YuzuRedeemOrderHelper is IYuzuRedeemOrderHelper, AccessControlDefaultAd
     error AccountLimitExceeded(address orderOwner, uint256 assets, uint256 remaining);
     error TotalLimitExceeded(uint256 assets, uint256 remaining);
     error InvalidLimit(uint256 limit);
+    error SlippageTooHigh(uint256 maxSlippageBps, uint256 ceiling);
+    error SlippageExceeded(uint256 settled, uint256 low, uint256 high);
+    error ZeroQuote();
+    error HelperNotVaultFiller();
 
-    /// @param vault_ The Yuzu V3 vault this helper is permanently bound to.
+    /// @param vault_ The yzILP V3 vault this helper is permanently bound to.
     /// @param asset_ The vault's underlying asset, checked against `vault_.asset()` below.
     /// @param admin_ Holds the two-step-transferable `DEFAULT_ADMIN_ROLE`, which only appoints
     /// `ADMIN_ROLE` holders.
     /// @param operator_ Initial `ADMIN_ROLE` holder: fee, whitelist switch, rescue, role grants.
-    // The only external call is the read-only `isUpdatingPool()` probe of the bound vault.
+    // The only external calls are read-only views of the bound vault.
     // slither-disable-next-line pess-call-forward-to-protected
     constructor(address vault_, address asset_, address admin_, address operator_)
         AccessControlDefaultAdminRules(0, admin_)
@@ -233,11 +254,10 @@ contract YuzuRedeemOrderHelper is IYuzuRedeemOrderHelper, AccessControlDefaultAd
         _vault = IYuzuProto(vault_);
         _asset = IERC20(asset_);
 
-        // Neither V3 router installs a catch-all fallback, so an absent `isUpdatingPool()` reverts
-        // rather than returning empty success — the probe cannot mis-classify a yzUSD vault.
-        // slither-disable-next-line low-level-calls,pess-arbitrary-call-destination-tainted
-        (bool ok, bytes memory ret) = vault_.staticcall(abi.encodeCall(IYuzuILPV2.isUpdatingPool, ()));
-        _vaultExposesPoolUpdateFlag = ok && ret.length == 32;
+        // yzILP V3 only: a vault without `isUpdatingPool()` (yzUSD) or the V3 fee views (yzILP V1
+        // and V2) reverts here, at deployment, rather than running on unmodelled pricing.
+        IYuzuILPV2(vault_).isUpdatingPool();
+        IYuzuILPV3Router(vault_).highWaterMark();
 
         _grantRole(ADMIN_ROLE, operator_);
         _setRoleAdmin(FILLER_ROLE, ADMIN_ROLE);
@@ -265,6 +285,11 @@ contract YuzuRedeemOrderHelper is IYuzuRedeemOrderHelper, AccessControlDefaultAd
         address orderOwner = _msgSender();
         _requireVaultSettlementOpen(orderOwner);
         _checkWhitelisted(orderOwner);
+        // Without the vault's ORDER_FILLER_ROLE the helper can neither fill nor force-cancel, so an
+        // order accepted now could only be recovered by the owner at the vault after `dueTime`.
+        if (!IAccessControl(address(_vault)).hasRole(VAULT_ORDER_FILLER_ROLE, address(this))) {
+            revert HelperNotVaultFiller();
+        }
         _checkHelperFee(maxHelperFeeBps);
         uint256 feeTokens = _feeFor(tokens);
         if (feeTokens != 0) {
@@ -273,6 +298,12 @@ contract YuzuRedeemOrderHelper is IYuzuRedeemOrderHelper, AccessControlDefaultAd
         // The vault's own createRedeemOrderWithMaxFee reverts FeeOverMaxFee; not reimplemented here.
         orderId = _vault.createRedeemOrderWithMaxFee(tokens - feeTokens, receiver, orderOwner, maxFeePpm);
         orderMinAssetsOut[orderId] = minAssetsOut;
+        // Exact in this transaction: the order's fee was stamped by the call above.
+        uint256 quote = _vault.previewRedeemOrder(tokens - feeTokens);
+        if (quote == 0) {
+            revert ZeroQuote();
+        }
+        orderExpectedAssets[orderId] = quote;
         if (feeTokens != 0) {
             orderFeeTokens[orderId] = feeTokens;
             totalEscrowedFeeShares += feeTokens;
@@ -303,6 +334,7 @@ contract YuzuRedeemOrderHelper is IYuzuRedeemOrderHelper, AccessControlDefaultAd
 
         uint256 entryBalance = _asset.balanceOf(address(this));
         uint256 settled = _settle(orderId, maxAssets, orderMinAssetsOut[orderId], entryBalance);
+        _checkSlippage(orderId, settled);
         _consumeLimits(order.owner, settled);
         _settleFee(orderId);
 
@@ -366,7 +398,8 @@ contract YuzuRedeemOrderHelper is IYuzuRedeemOrderHelper, AccessControlDefaultAd
         if (newFeeBps != 0 && newFeeRecipient == address(0)) {
             revert InvalidZeroAddress();
         }
-        // Shares sent to the vault proxy are unrecoverable; to this helper, admin-rescuable.
+        // The vault is not a fee recipient (its shares there are pending-order escrow, recoverable
+        // only through a vault admin rescue); this helper would hold them as un-owned balance.
         if (newFeeRecipient == address(_vault) || newFeeRecipient == address(this)) {
             revert InvalidReceiver();
         }
@@ -412,6 +445,22 @@ contract YuzuRedeemOrderHelper is IYuzuRedeemOrderHelper, AccessControlDefaultAd
         emit UpdatedLimits(newTxCap, newAccountLimit, newTotalLimit);
     }
 
+    /// @notice Sets the slippage guard: the largest allowed move, in basis points, of a helper
+    /// fill's payout from the quote recorded at order creation. 0 turns the guard off. The band is
+    /// read at fill, so a change applies at once to every pending order: widening it lets orders
+    /// blocked by a legitimate price move fill, tightening it can block pending orders until they
+    /// are cancelled or the band is widened again.
+    // Guarded by `_checkRole(LIMIT_MANAGER_ROLE)` in the body.
+    // slither-disable-next-line pess-unprotected-setter
+    function setMaxSlippage(uint16 newMaxSlippageBps) external {
+        _checkRole(LIMIT_MANAGER_ROLE);
+        if (newMaxSlippageBps > MAX_SLIPPAGE_BPS) {
+            revert SlippageTooHigh(newMaxSlippageBps, MAX_SLIPPAGE_BPS);
+        }
+        maxSlippageBps = newMaxSlippageBps;
+        emit UpdatedMaxSlippage(newMaxSlippageBps);
+    }
+
     /// @notice Recovers tokens sent to this contract by mistake or as a donation. Never required
     /// for correct operation: settlement's delta accounting already tolerates stray balances.
     /// Escrowed helper fees (vault shares) are owed to owners or `feeRecipient` and cannot be taken.
@@ -437,11 +486,6 @@ contract YuzuRedeemOrderHelper is IYuzuRedeemOrderHelper, AccessControlDefaultAd
     }
 
     /// @inheritdoc IYuzuRedeemOrderHelper
-    function vaultExposesPoolUpdateFlag() external view returns (bool) {
-        return _vaultExposesPoolUpdateFlag;
-    }
-
-    /// @inheritdoc IYuzuRedeemOrderHelper
     function remainingAccountLimit(address orderOwner) external view returns (uint256) {
         return _remaining(_accountUsage[orderOwner], accountLimit);
     }
@@ -451,19 +495,11 @@ contract YuzuRedeemOrderHelper is IYuzuRedeemOrderHelper, AccessControlDefaultAd
         return _remaining(_totalUsage, totalLimit);
     }
 
-    /// @dev Reverts while the bound vault has a price restatement staged, so no order can be
+    /// @dev Reverts while the bound vault has a pool restatement staged, so no order can be
     /// created or filled through this helper at the pre-restatement price. Finalize is not gated:
-    /// it only pays the amount fixed at fill. yzILP is
-    /// asked directly for `isUpdatingPool()`; yzUSD is asked for `canRedeem(owner)`, the only
-    /// surface through which its private `_isUpdatingNav` flag is observable. `canRedeem` also
-    /// folds in `paused()` and the redeemer allowlist, both of which already block this helper's
-    /// paths inside the vault, so the extra terms narrow nothing that was previously reachable.
+    /// it only pays the amount fixed at fill.
     function _requireVaultSettlementOpen(address orderOwner) internal view {
-        if (_vaultExposesPoolUpdateFlag) {
-            if (IYuzuILPV2(address(_vault)).isUpdatingPool()) {
-                revert VaultSettlementClosed(orderOwner);
-            }
-        } else if (!IYuzuProtoV2(address(_vault)).canRedeem(orderOwner)) {
+        if (IYuzuILPV2(address(_vault)).isUpdatingPool()) {
             revert VaultSettlementClosed(orderOwner);
         }
     }
@@ -499,6 +535,22 @@ contract YuzuRedeemOrderHelper is IYuzuRedeemOrderHelper, AccessControlDefaultAd
     function _checkRollingLimit(uint256 limit) internal pure {
         if (limit != type(uint256).max && limit > type(uint192).max) {
             revert InvalidLimit(limit);
+        }
+    }
+
+    /// @dev Reverts when `settled` is more than `maxSlippageBps` away from the creation quote, in
+    /// either direction. Bands round up. Skipped while the guard is off.
+    function _checkSlippage(uint256 orderId, uint256 settled) internal view {
+        uint256 bps = maxSlippageBps;
+        if (bps == 0) {
+            return;
+        }
+        uint256 expected = orderExpectedAssets[orderId];
+        uint256 band = Math.mulDiv(expected, bps, 10_000, Math.Rounding.Ceil);
+        uint256 low = expected - band;
+        uint256 high = expected + band;
+        if (settled < low || settled > high) {
+            revert SlippageExceeded(settled, low, high);
         }
     }
 
@@ -589,8 +641,8 @@ contract YuzuRedeemOrderHelper is IYuzuRedeemOrderHelper, AccessControlDefaultAd
         }
     }
 
-    /// @dev The two order terms this contract validates on the owner's behalf, wherever an order
-    /// originates. Kept in one place so no entry point can be added that silently omits either.
+    /// @dev The two order terms this contract validates on the owner's behalf at creation. Kept in
+    /// one place so a future entry point cannot silently omit either.
     /// A self-referential receiver makes {_settle}'s residual equality unsatisfiable, and the vault
     /// as receiver pays the vault itself; a zero floor makes its `settled < minAssetsOut` check
     /// unsatisfiable, which is not a floor at all.

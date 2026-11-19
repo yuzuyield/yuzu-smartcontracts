@@ -38,7 +38,7 @@ interface IYuzuRedeemOrderHelper {
     /// its order is finalized.
     event ChargedFee(uint256 indexed orderId, address indexed owner, address indexed feeRecipient, uint256 feeTokens);
 
-    /// @notice Emitted when an escrowed two-transaction fee is returned to the owner: the order was
+    /// @notice Emitted when an escrowed helper fee is returned to the owner: the order was
     /// cancelled, or no fee recipient is set when it settles.
     event RefundedFee(uint256 indexed orderId, address indexed owner, uint256 feeTokens);
 
@@ -50,6 +50,9 @@ interface IYuzuRedeemOrderHelper {
 
     /// @notice Emitted when the per-fill cap or the rolling 24h limits change.
     event UpdatedLimits(uint256 txCap, uint256 accountLimit, uint256 totalLimit);
+
+    /// @notice Emitted when the slippage guard changes.
+    event UpdatedMaxSlippage(uint16 maxSlippageBps);
 
     /// @notice Creates a redeem order with `owner = msg.sender` and `controller = address(this)`,
     /// forwarding to the vault's own max-fee check (the vault also enforces its `REDEEMER_ROLE`
@@ -78,14 +81,15 @@ interface IYuzuRedeemOrderHelper {
     ) external returns (uint256 orderId);
 
     /// @notice Fills and finalizes a pending order the helper controls in one transaction, pulling
-    /// at most `maxAssets` from the caller and refunding any unused amount. While `whitelistEnabled`,
-    /// reverts `NotWhitelisted` if the order owner has been delisted since creation. The settled
-    /// payout must fit `txCap`, the owner's remaining `accountLimit` and the remaining `totalLimit`,
-    /// else it reverts `AboveTxCap`, `AccountLimitExceeded` or `TotalLimitExceeded`. On any of these
-    /// the order stays Pending.
+    /// at most `maxAssets` from the caller and refunding any unused amount. Reverts, leaving the
+    /// order Pending, with `ExecDeadlineExpired`, `OrderNotPending`, `OrderNotControlledByHelper`,
+    /// `VaultSettlementClosed` (pool update staged), `NotWhitelisted` (owner delisted since
+    /// creation, while `whitelistEnabled`), `MinAssetsOutNotMet` (below the owner floor),
+    /// `SlippageExceeded` (outside the band around the creation quote), or `AboveTxCap`,
+    /// `AccountLimitExceeded` or `TotalLimitExceeded`.
     /// @param orderId The vault's order id.
     /// @param maxAssets Upper bound on the assets the caller is willing to pay; the caller's own
-    /// slippage guard against a fee change or NAV move since order creation.
+    /// slippage guard against a fee change or price move since order creation.
     /// @param execDeadline Caller's own staleness guard; reverts if `block.timestamp` exceeds it.
     function fillAndFinalizeRedeemOrder(uint256 orderId, uint256 maxAssets, uint256 execDeadline) external;
 
@@ -102,7 +106,7 @@ interface IYuzuRedeemOrderHelper {
     /// contract-level note on why an unrestricted passthrough is never exposed.
     function cancelOwnRedeemOrder(uint256 orderId) external;
 
-    /// @notice Resolves the escrowed helper fee of a two-transaction order from the vault's order
+    /// @notice Resolves the escrowed helper fee of an order from the vault's order
     /// status: Finalized pays the current `feeRecipient` (or refunds the owner if there is none),
     /// Cancelled refunds the owner. Callable by anyone; a no-op once settled. Reverts
     /// `FeeNotSettleable` while the order is Pending or Filled (the payout has not happened yet).
@@ -117,7 +121,11 @@ interface IYuzuRedeemOrderHelper {
     /// @notice The owner's price floor recorded for `orderId` at creation, enforced at fill.
     function orderMinAssetsOut(uint256 orderId) external view returns (uint256);
 
-    /// @notice The helper fee, in vault shares, escrowed for a two-transaction order at creation;
+    /// @notice The vault's quote for `orderId`'s payout, recorded at creation; the slippage guard's
+    /// reference.
+    function orderExpectedAssets(uint256 orderId) external view returns (uint256);
+
+    /// @notice The helper fee, in vault shares, escrowed for an order at creation;
     /// zero once settled (charged or refunded).
     function orderFeeTokens(uint256 orderId) external view returns (uint256);
 
@@ -129,10 +137,6 @@ interface IYuzuRedeemOrderHelper {
 
     /// @notice Receives the helper fee, in vault shares.
     function feeRecipient() external view returns (address);
-
-    /// @notice True when the bound vault is a yzILP-family vault, whose price-restatement freeze
-    /// is read from `isUpdatingPool()`. False for the yzUSD family, read from `canRedeem`.
-    function vaultExposesPoolUpdateFlag() external view returns (bool);
 
     /// @notice True while only `isWhitelisted` owners may create or be filled through the helper.
     /// On from construction.
@@ -157,4 +161,8 @@ interface IYuzuRedeemOrderHelper {
 
     /// @notice Capacity left under `totalLimit` now; `type(uint256).max` if disabled.
     function remainingTotalLimit() external view returns (uint256);
+
+    /// @notice Largest allowed move, in basis points, of a helper fill's payout from
+    /// `orderExpectedAssets`, in either direction. 0 means the guard is off.
+    function maxSlippageBps() external view returns (uint16);
 }

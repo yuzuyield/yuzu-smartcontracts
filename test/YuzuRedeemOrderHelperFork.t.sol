@@ -382,7 +382,6 @@ contract YuzuRedeemOrderHelperForkTest is Test {
 
         YuzuRedeemOrderHelper midUpdateHelper = new YuzuRedeemOrderHelper(YZUSDE, USDC, admin, admin);
 
-        assertTrue(midUpdateHelper.vaultExposesPoolUpdateFlag(), "yzUSDe must classify as the pool-update family");
         assertTrue(IYuzuILPV2(YZUSDE).isUpdatingPool(), "pinned block no longer has a staged pool update");
 
         address someUser = makeAddr("forkMidUpdateUser");
