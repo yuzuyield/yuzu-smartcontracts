@@ -255,8 +255,11 @@ contract YuzuRedeemOrderHelper is IYuzuRedeemOrderHelper, AccessControlDefaultAd
         _asset = IERC20(asset_);
 
         // yzILP V3 only: a vault without `isUpdatingPool()` (yzUSD) or the V3 fee views (yzILP V1
-        // and V2) reverts here, at deployment, rather than running on unmodelled pricing.
+        // and V2) reverts here, at deployment, rather than running on unmodelled pricing. The calls
+        // are existence probes; their return values are intentionally unused.
+        // slither-disable-next-line unused-return
         IYuzuILPV2(vault_).isUpdatingPool();
+        // slither-disable-next-line unused-return
         IYuzuILPV3Router(vault_).highWaterMark();
 
         _grantRole(ADMIN_ROLE, operator_);
