@@ -110,6 +110,8 @@ contract MinimalOrderVault {
 /// the load-bearing ones here; the full invariant/fuzz/fork suite is Phase 4.
 contract YuzuRedeemOrderHelperTest is YuzuV3TestBase {
     address internal helperFiller = makeAddr("helperFiller");
+    /// @dev Holds the helper's DEFAULT_ADMIN_ROLE; `admin` is the operator (ADMIN_ROLE).
+    address internal helperGovernance = makeAddr("helperGovernance");
 
     YuzuRedeemOrderHelper internal ilpHelper;
 
@@ -132,7 +134,7 @@ contract YuzuRedeemOrderHelperTest is YuzuV3TestBase {
         _approve(user, address(yzilp));
         _approve(other, address(yzilp));
 
-        ilpHelper = new YuzuRedeemOrderHelper(address(yzilp), address(asset), admin, admin);
+        ilpHelper = new YuzuRedeemOrderHelper(address(yzilp), address(asset), helperGovernance, admin);
 
         vm.startPrank(admin);
         yzilp.grantRole(ORDER_FILLER_ROLE, address(ilpHelper));
@@ -494,10 +496,10 @@ contract YuzuRedeemOrderHelperTest is YuzuV3TestBase {
         bytes32 pauseRole = ilpHelper.PAUSE_MANAGER_ROLE();
         bytes32 unpauseRole = ilpHelper.UNPAUSE_MANAGER_ROLE();
         bytes32 adminRole = ilpHelper.ADMIN_ROLE();
-        vm.startPrank(admin);
+        vm.prank(admin);
         ilpHelper.grantRole(unpauseRole, unpauser);
+        vm.prank(helperGovernance);
         ilpHelper.grantRole(adminRole, operator);
-        vm.stopPrank();
 
         vm.prank(unpauser);
         vm.expectRevert(
@@ -949,14 +951,19 @@ contract YuzuRedeemOrderHelperTest is YuzuV3TestBase {
         vm.expectRevert(
             abi.encodeWithSelector(YuzuRedeemOrderHelper.AssetMismatch.selector, wrongAsset, address(asset))
         );
-        new YuzuRedeemOrderHelper(address(yzilp), wrongAsset, admin, admin);
+        new YuzuRedeemOrderHelper(address(yzilp), wrongAsset, helperGovernance, admin);
     }
 
     function test_Constructor_Revert_ZeroAddress() public {
         vm.expectRevert(YuzuRedeemOrderHelper.InvalidZeroAddress.selector);
-        new YuzuRedeemOrderHelper(address(0), address(asset), admin, admin);
+        new YuzuRedeemOrderHelper(address(0), address(asset), helperGovernance, admin);
         vm.expectRevert(YuzuRedeemOrderHelper.InvalidZeroAddress.selector);
-        new YuzuRedeemOrderHelper(address(yzilp), address(asset), admin, address(0));
+        new YuzuRedeemOrderHelper(address(yzilp), address(asset), helperGovernance, address(0));
+    }
+
+    function test_Constructor_Revert_AdminIsOperator() public {
+        vm.expectRevert(abi.encodeWithSelector(YuzuRedeemOrderHelper.AdminIsOperator.selector, admin));
+        new YuzuRedeemOrderHelper(address(yzilp), address(asset), admin, admin);
     }
 
     // --- gap-fill: F1, previewRedeemOrder never appears in the settlement path -----------------
@@ -966,7 +973,8 @@ contract YuzuRedeemOrderHelperTest is YuzuV3TestBase {
     /// it, this whole test would revert instead of asserting a finalized order.
     function test_F1_SettlementNeverCallsPreviewRedeemOrder() public {
         MinimalOrderVault mockVault = new MinimalOrderVault(address(asset));
-        YuzuRedeemOrderHelper mockHelper = new YuzuRedeemOrderHelper(address(mockVault), address(asset), admin, admin);
+        YuzuRedeemOrderHelper mockHelper =
+            new YuzuRedeemOrderHelper(address(mockVault), address(asset), helperGovernance, admin);
 
         bytes32 fillerRole = mockHelper.FILLER_ROLE();
         vm.startPrank(admin);
@@ -997,7 +1005,7 @@ contract YuzuRedeemOrderHelperTest is YuzuV3TestBase {
     function test_Constructor_RejectsNonIlpVault_IlpFillWorks() public {
         address usd = address(_deployYuzuUSDV3());
         vm.expectRevert();
-        new YuzuRedeemOrderHelper(usd, address(asset), admin, admin);
+        new YuzuRedeemOrderHelper(usd, address(asset), helperGovernance, admin);
 
         assertFalse(IYuzuProtoV2(address(yzilp)).canRedeem(user), "ILP canRedeem is expected to be hardcoded false");
         _happyPath(IYuzuProto(address(yzilp)), ilpHelper);
@@ -1190,7 +1198,7 @@ contract YuzuRedeemOrderHelperTest is YuzuV3TestBase {
     }
 
     function test_Whitelist_OnByDefault() public {
-        YuzuRedeemOrderHelper fresh = new YuzuRedeemOrderHelper(address(yzilp), address(asset), admin, admin);
+        YuzuRedeemOrderHelper fresh = new YuzuRedeemOrderHelper(address(yzilp), address(asset), helperGovernance, admin);
         assertTrue(fresh.whitelistEnabled());
 
         vm.startPrank(user);
@@ -1365,32 +1373,39 @@ contract YuzuRedeemOrderHelperTest is YuzuV3TestBase {
         ilpHelper.setLimits(txCap_, accountLimit_, totalLimit_);
     }
 
+    /// @dev All limits start at 0, so a fresh helper refuses new orders outright: no fill could pay
+    /// them, and the owner's shares and fee are never escrowed for an order that cannot fill.
     function test_Limits_FreshHelperFailsClosed() public {
-        YuzuRedeemOrderHelper fresh = new YuzuRedeemOrderHelper(address(yzilp), address(asset), admin, admin);
-        bytes32 fillerRole = fresh.FILLER_ROLE();
+        YuzuRedeemOrderHelper fresh = new YuzuRedeemOrderHelper(address(yzilp), address(asset), helperGovernance, admin);
         bytes32 listRole = fresh.WHITELIST_MANAGER_ROLE();
         address[] memory partners = new address[](1);
         partners[0] = user;
         vm.startPrank(admin);
         yzilp.grantRole(ORDER_FILLER_ROLE, address(fresh));
-        fresh.grantRole(fillerRole, helperFiller);
         fresh.grantRole(listRole, admin);
         fresh.setWhitelisted(partners, true);
         vm.stopPrank();
-        vm.prank(helperFiller);
-        asset.approve(address(fresh), type(uint256).max);
 
         vm.startPrank(user);
         uint256 shares = yzilp.deposit(100e6, user);
         yzilp.approve(address(fresh), shares);
-        uint256 orderId = fresh.createRedeemOrderWithMaxFee(shares, user, 1e6, 100, 1);
+        vm.expectRevert(abi.encodeWithSelector(YuzuRedeemOrderHelper.MinAssetsOutUnreachable.selector, 1, 0));
+        fresh.createRedeemOrderWithMaxFee(shares, user, 1e6, 100, 1);
         vm.stopPrank();
-        uint256 expectedAssets = yzilp.previewRedeemOrder(shares);
+        assertEq(yzilp.balanceOf(user), shares, "shares left the owner");
+    }
 
-        vm.prank(helperFiller);
-        vm.expectRevert(abi.encodeWithSelector(YuzuRedeemOrderHelper.AboveTxCap.selector, expectedAssets, 0));
-        fresh.fillAndFinalizeRedeemOrder(orderId, expectedAssets, block.timestamp + 1 days);
-        assertEq(uint256(yzilp.getRedeemOrder(orderId).status), uint256(OrderStatus.Pending));
+    /// @dev L2: a floor above the smallest limit can never be paid by one fill, so it is refused at
+    /// creation; a floor exactly at that limit is accepted.
+    function test_Limits_CreateRejectsFloorAboveSmallestLimit() public {
+        _setLimits(50e6, 80e6, type(uint256).max);
+        vm.startPrank(user);
+        uint256 shares = yzilp.deposit(100e6, user);
+        yzilp.approve(address(ilpHelper), shares);
+        vm.expectRevert(abi.encodeWithSelector(YuzuRedeemOrderHelper.MinAssetsOutUnreachable.selector, 50e6 + 1, 50e6));
+        ilpHelper.createRedeemOrderWithMaxFee(shares, user, 1e6, 100, 50e6 + 1);
+        ilpHelper.createRedeemOrderWithMaxFee(shares, user, 1e6, 100, 50e6);
+        vm.stopPrank();
     }
 
     function test_Limits_TxCapBlocksLargeFillOnly() public {
@@ -1492,6 +1507,19 @@ contract YuzuRedeemOrderHelperTest is YuzuV3TestBase {
         vm.expectRevert(abi.encodeWithSelector(YuzuRedeemOrderHelper.InvalidLimit.selector, tooLarge));
         ilpHelper.setLimits(1, 1, tooLarge);
         ilpHelper.setLimits(type(uint256).max, type(uint192).max, type(uint256).max);
+
+        // A11: among enabled limits, txCap <= accountLimit <= totalLimit; a disabled limit binds nothing.
+        uint256 off = type(uint256).max;
+        vm.expectRevert(abi.encodeWithSelector(YuzuRedeemOrderHelper.LimitsOutOfOrder.selector, 2, 1));
+        ilpHelper.setLimits(2, 1, off);
+        vm.expectRevert(abi.encodeWithSelector(YuzuRedeemOrderHelper.LimitsOutOfOrder.selector, 2, 1));
+        ilpHelper.setLimits(2, off, 1);
+        vm.expectRevert(abi.encodeWithSelector(YuzuRedeemOrderHelper.LimitsOutOfOrder.selector, 2, 1));
+        ilpHelper.setLimits(off, 2, 1);
+        ilpHelper.setLimits(off, off, 1);
+        ilpHelper.setLimits(1, off, off);
+        ilpHelper.setLimits(1, 2, 3);
+        ilpHelper.setLimits(0, 0, 0); // the all-zero emergency stop stays valid
         vm.stopPrank();
     }
 
@@ -1547,6 +1575,22 @@ contract YuzuRedeemOrderHelperTest is YuzuV3TestBase {
         assertEq(ilpHelper.orderExpectedAssets(orderId), quoted);
         _fill(orderId, quoted);
         assertEq(yzilp.getRedeemOrder(orderId).assets, quoted, "fill at an unmoved price drifted from the quote");
+    }
+
+    /// @dev L2: with the guard on, a floor above the band's upper edge can never be met by a fill,
+    /// so it is refused at creation; a floor exactly at the edge is accepted.
+    function test_Slippage_CreateRejectsFloorAboveBand() public {
+        _setSlippage(100); // 1%
+        vm.startPrank(user);
+        uint256 shares = yzilp.deposit(200e6, user);
+        yzilp.approve(address(ilpHelper), shares);
+        uint256 half = shares / 2;
+        (, uint256 high) = _bands(yzilp.previewRedeemOrder(half), 100);
+        vm.expectRevert(abi.encodeWithSelector(YuzuRedeemOrderHelper.MinAssetsOutUnreachable.selector, high + 1, high));
+        ilpHelper.createRedeemOrderWithMaxFee(half, user, 1e6, 100, high + 1);
+        uint256 orderId = ilpHelper.createRedeemOrderWithMaxFee(half, user, 1e6, 100, high);
+        vm.stopPrank();
+        assertEq(uint256(yzilp.getRedeemOrder(orderId).status), uint256(OrderStatus.Pending));
     }
 
     /// @dev A sudden price jump after creation is the treasury's risk: above the band the fill

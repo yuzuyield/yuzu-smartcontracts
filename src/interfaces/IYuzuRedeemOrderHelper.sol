@@ -54,11 +54,19 @@ interface IYuzuRedeemOrderHelper {
     /// @notice Emitted when the slippage guard changes.
     event UpdatedMaxSlippage(uint16 maxSlippageBps);
 
+    /// @notice Emitted when `ADMIN_ROLE` recovers tokens held by the helper outside fee escrow.
+    event RescuedTokens(address indexed token, address indexed to, uint256 amount);
+
     /// @notice Creates a redeem order with `owner = msg.sender` and `controller = address(this)`,
     /// forwarding to the vault's own max-fee check (the vault also enforces its `REDEEMER_ROLE`
     /// allowlist on the owner). While `whitelistEnabled`, the caller must be `isWhitelisted`, else
     /// `NotWhitelisted`; the same check runs again at fill. The helper fee is pulled from the
     /// caller's shares now and held in escrow (the order is for `tokens` minus it); see {settleFee}.
+    /// The vault's `minRedeemOrder` therefore applies to `tokens` net of the helper fee: an order
+    /// sized at exactly the vault minimum reverts while a helper fee is set. The fee rounds down, to
+    /// zero for `tokens < 10_000 / feeBps`. Reverts `MinAssetsOutUnreachable` when no fill could meet
+    /// `minAssetsOut`: above the smallest of `txCap`, `accountLimit` and `totalLimit`, or, while the
+    /// slippage guard is on, above the upper edge of the band around the creation quote.
     /// @param tokens Vault shares to redeem, gross of the helper fee.
     /// @param receiver Address to receive the settled assets on finalize. May not be the helper:
     /// a self-referential receiver makes the settlement path's residual-balance equality
@@ -145,15 +153,19 @@ interface IYuzuRedeemOrderHelper {
     /// @notice Whether `account` is on the helper's partner whitelist.
     function isWhitelisted(address account) external view returns (bool);
 
-    /// @notice Largest single payout, in asset units, a helper fill may settle. 0 blocks every fill.
+    /// @notice Largest single payout, in asset units, a helper fill may settle. 0 blocks every fill
+    /// and every new order.
     function txCap() external view returns (uint256);
 
-    /// @notice Assets one order owner may receive through helper fills per rolling 24 hours.
-    /// `type(uint256).max` disables it; 0 blocks every fill.
+    /// @notice Capacity, in assets, one order owner may receive through helper fills: a bucket of
+    /// this size that refills linearly over 24 hours. With an unchanged limit, cumulative payouts in
+    /// any 24 hours can approach twice the limit. `type(uint256).max` disables it; 0 blocks every
+    /// fill and every new order.
     function accountLimit() external view returns (uint256);
 
-    /// @notice Assets all owners together may receive through helper fills per rolling 24 hours.
-    /// `type(uint256).max` disables it; 0 blocks every fill.
+    /// @notice Capacity, in assets, all owners together may receive through helper fills, with the
+    /// same 24-hour linear refill as `accountLimit`. `type(uint256).max` disables it; 0 blocks every
+    /// fill and every new order.
     function totalLimit() external view returns (uint256);
 
     /// @notice Capacity `owner` has left under `accountLimit` now; `type(uint256).max` if disabled.

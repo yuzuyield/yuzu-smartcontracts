@@ -35,7 +35,9 @@ contract YuzuRedeemOrderHelperForkTest is Test {
     IERC20 internal asset;
     YuzuRedeemOrderHelper internal helper;
 
+    /// @dev The helper operator (ADMIN_ROLE); `helperGovernance` holds DEFAULT_ADMIN_ROLE, as in production.
     address internal admin = makeAddr("forkAdmin");
+    address internal helperGovernance = makeAddr("forkHelperGovernance");
     address internal helperFiller = makeAddr("forkHelperFiller");
 
     /// @dev Forks, deploys the helper and wires its roles exactly as ops would. Returns `false`
@@ -56,7 +58,7 @@ contract YuzuRedeemOrderHelperForkTest is Test {
         vm.prank(YZCASH_DEFAULT_ADMIN);
         IAccessControl(YZCASH).grantRole(ADMIN_ROLE, address(this));
 
-        helper = new YuzuRedeemOrderHelper(YZCASH, USDC, admin, admin);
+        helper = new YuzuRedeemOrderHelper(YZCASH, USDC, helperGovernance, admin);
         IAccessControl(YZCASH).grantRole(ORDER_FILLER_ROLE, address(helper));
 
         bytes32 fillerRole = helper.FILLER_ROLE();
@@ -380,7 +382,7 @@ contract YuzuRedeemOrderHelperForkTest is Test {
     function test_ForkScenario9_RestatementGate_LiveVaultMidPoolUpdate() public {
         if (!_setUpFork()) return;
 
-        YuzuRedeemOrderHelper midUpdateHelper = new YuzuRedeemOrderHelper(YZUSDE, USDC, admin, admin);
+        YuzuRedeemOrderHelper midUpdateHelper = new YuzuRedeemOrderHelper(YZUSDE, USDC, helperGovernance, admin);
 
         assertTrue(IYuzuILPV2(YZUSDE).isUpdatingPool(), "pinned block no longer has a staged pool update");
 

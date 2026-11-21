@@ -420,6 +420,7 @@ contract YuzuRedeemOrderHelperInvariantTest is YuzuV3TestBase {
 
     address internal vaultFiller = makeAddr("invariantVaultFiller");
     address internal outsider = makeAddr("invariantOutsider");
+    address internal helperGovernance = makeAddr("invariantHelperGovernance");
 
     function setUp() public {
         asset = _newAsset();
@@ -433,7 +434,7 @@ contract YuzuRedeemOrderHelperInvariantTest is YuzuV3TestBase {
         yzilp.setIsRedeemRestricted(false);
         vm.stopPrank();
 
-        helper = new YuzuRedeemOrderHelper(address(yzilp), address(asset), admin, admin);
+        helper = new YuzuRedeemOrderHelper(address(yzilp), address(asset), helperGovernance, admin);
 
         vm.startPrank(admin);
         yzilp.grantRole(ORDER_FILLER_ROLE, address(helper));
