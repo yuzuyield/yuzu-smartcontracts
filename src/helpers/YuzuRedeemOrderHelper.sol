@@ -33,7 +33,7 @@ import {Order, OrderStatus} from "../interfaces/proto/IYuzuOrderBookDefinitions.
  *   `setRedeemOrderFee` moves between creation and fill. Settlement instead pulls up to
  *   `maxAssets` from the filler, lets the vault discover the true settled amount, and refunds the
  *   difference — correct for any fee path, with no vault math reimplemented here.
- * - Every external call asserts a *balance delta*, never an absolute-zero balance. A third party
+ * - Settlement ({_settle}) asserts a *balance delta*, never an absolute-zero balance. A third party
  *   can donate dust to this contract at any time; an absolute-zero assertion would let that dust
  *   permanently brick every future fill.
  * - `receiver` may never be this contract. The vault's `finalizeRedeemOrder` pays `order.receiver`
@@ -46,11 +46,12 @@ import {Order, OrderStatus} from "../interfaces/proto/IYuzuOrderBookDefinitions.
  *   only cancel path this contract exposes is `cancelOwnRedeemOrder`, which refuses every order
  *   whose `controller` is not this contract — the force-cancel power never becomes a primitive
  *   over the wider order book.
- * - A pause landing between fill and finalize makes the whole `fillAndFinalizeRedeemOrder` call
- *   revert; this is intentional. A partially-applied state where the filler paid and the user did
- *   not receive would be strictly worse. `finalizeRedeemOrder` (permissionless) and
- *   `cancelOwnRedeemOrder` (`CANCEL_MANAGER_ROLE`) are the recovery paths once the pause clears or
- *   the order is abandoned.
+ * - A vault pause landing between fill and finalize makes the whole `fillAndFinalizeRedeemOrder`
+ *   call revert, fill included, so the order stays Pending; this is intentional. A
+ *   partially-applied state where the filler paid and the user did not receive would be strictly
+ *   worse. Once the pause clears, the recovery paths are a new `fillAndFinalizeRedeemOrder`,
+ *   `cancelOwnRedeemOrder` (`CANCEL_MANAGER_ROLE`), or the owner's own vault cancel after
+ *   `dueTime`. `finalizeRedeemOrder` applies only to an order another vault filler already filled.
  *
  * @dev Two guards close gaps that only exist because this helper composes the vault's
  * deliberately *asynchronous* order path into a synchronous one:
@@ -255,8 +256,8 @@ contract YuzuRedeemOrderHelper is IYuzuRedeemOrderHelper, AccessControlDefaultAd
 
     /// @param vault_ The yzILP V3 vault this helper is permanently bound to.
     /// @param asset_ The vault's underlying asset, checked against `vault_.asset()` below.
-    /// @param admin_ Holds the two-step-transferable `DEFAULT_ADMIN_ROLE`, which only appoints
-    /// `ADMIN_ROLE` holders.
+    /// @param admin_ Holds the two-step-transferable `DEFAULT_ADMIN_ROLE`: appoints and removes
+    /// `ADMIN_ROLE` holders (itself included) and controls its own transfer.
     /// @param operator_ Initial `ADMIN_ROLE` holder: fee, whitelist switch, rescue, role grants.
     // The only external calls are read-only views of the bound vault.
     // slither-disable-next-line pess-call-forward-to-protected

@@ -3,7 +3,7 @@ pragma solidity ^0.8.30;
 
 /**
  * @title IYuzuRedeemOrderHelper
- * @notice Surface for a helper deployed beside a single Yuzu V3 vault. A user creates a redeem
+ * @notice Surface for a helper deployed beside a single yzILP V3 vault. A user creates a redeem
  * order through the helper so the helper is recorded as the order's `controller`, which lets a
  * permissioned filler `fill` and `finalize` the order in one transaction. The helper never
  * custodies the underlying asset across calls; between creation and settlement it holds only the
@@ -68,9 +68,10 @@ interface IYuzuRedeemOrderHelper {
     /// `minAssetsOut`: above the smallest of `txCap`, `accountLimit` and `totalLimit`, or, while the
     /// slippage guard is on, above the upper edge of the band around the creation quote.
     /// @param tokens Vault shares to redeem, gross of the helper fee.
-    /// @param receiver Address to receive the settled assets on finalize. May not be the helper:
-    /// a self-referential receiver makes the settlement path's residual-balance equality
-    /// unsatisfiable and strands the payout in the helper.
+    /// @param receiver Address to receive the settled assets on finalize. May not be the helper or
+    /// the vault (`InvalidReceiver`): a self-referential receiver makes the settlement path's
+    /// residual-balance equality unsatisfiable and strands the payout in the helper, and the vault
+    /// as receiver would pay the vault itself.
     /// @param maxFeePpm Caller's fee ceiling; the vault reverts `FeeOverMaxFee` above it.
     /// @param maxHelperFeeBps Caller's cap on the helper fee rate; reverts `HelperFeeAboveMax` if
     /// `feeBps` is above it (e.g. an admin `setFee` landed first).
@@ -94,18 +95,24 @@ interface IYuzuRedeemOrderHelper {
     /// `VaultSettlementClosed` (pool update staged), `NotWhitelisted` (owner delisted since
     /// creation, while `whitelistEnabled`), `MinAssetsOutNotMet` (below the owner floor),
     /// `SlippageExceeded` (outside the band around the creation quote), or `AboveTxCap`,
-    /// `AccountLimitExceeded` or `TotalLimitExceeded`.
+    /// `AccountLimitExceeded` or `TotalLimitExceeded`. Also reverts, with the same effect, on
+    /// `ResidualBalanceMismatch`, `AccessControlUnauthorizedAccount` (caller lacks `FILLER_ROLE`),
+    /// ERC-20 transfer and allowance errors (for example `maxAssets` below the settled amount), and
+    /// vault errors from the fill or the finalize: `OrderOwnerNotRedeemer` (owner lost the vault's
+    /// `REDEEMER_ROLE`) and `EnforcedPause` (vault paused).
     /// @param orderId The vault's order id.
     /// @param maxAssets Upper bound on the assets the caller is willing to pay; the caller's own
     /// slippage guard against a fee change or price move since order creation.
     /// @param execDeadline Caller's own staleness guard; reverts if `block.timestamp` exceeds it.
     function fillAndFinalizeRedeemOrder(uint256 orderId, uint256 maxAssets, uint256 execDeadline) external;
 
-    /// @notice Permissionless passthrough to the vault's `finalizeRedeemOrder` for any filled order
-    /// this helper controls (e.g. after a pause cleared, or one filled by another vault filler),
-    /// then {settleFee}. Reverts `MinAssetsOutNotMet` for an order filled below its
-    /// `orderMinAssetsOut`; only its owner can then finalize it, directly at the vault. Not gated by
-    /// a staged restatement: it pays only the amount fixed at fill.
+    /// @notice Permissionless passthrough to the vault's `finalizeRedeemOrder` for a filled order
+    /// this helper controls, then {settleFee}. A helper fill never leaves an order Filled (a vault
+    /// pause between fill and finalize reverts the whole fill), so this applies to an order another
+    /// vault filler filled; a Pending order reverts at the vault with `OrderNotFilled`. Reverts
+    /// `MinAssetsOutNotMet` for an order filled below its `orderMinAssetsOut`; only its owner can
+    /// then finalize it, directly at the vault. Not gated by a staged restatement: it pays only the
+    /// amount fixed at fill.
     function finalizeRedeemOrder(uint256 orderId) external;
 
     /// @notice Cancels a pending order the helper created, refusing every other order; restricted to
@@ -126,7 +133,8 @@ interface IYuzuRedeemOrderHelper {
     /// @notice The underlying asset of `vault`.
     function asset() external view returns (address);
 
-    /// @notice The owner's price floor recorded for `orderId` at creation, enforced at fill.
+    /// @notice The owner's price floor recorded for `orderId` at creation, enforced at the helper
+    /// fill and by the {finalizeRedeemOrder} passthrough.
     function orderMinAssetsOut(uint256 orderId) external view returns (uint256);
 
     /// @notice The vault's quote for `orderId`'s payout, recorded at creation; the slippage guard's
