@@ -1593,6 +1593,53 @@ contract YuzuRedeemOrderHelperTest is YuzuV3TestBase {
         assertEq(uint256(yzilp.getRedeemOrder(orderId).status), uint256(OrderStatus.Pending));
     }
 
+    /// @dev L2: with the guard on, no fill settles below the band's lower edge, so a band floor
+    /// above the smallest limit is refused at creation even when `minAssetsOut` itself fits.
+    function test_Slippage_CreateRejectsBandFloorAboveLimit() public {
+        _setSlippage(100); // 1%
+        vm.startPrank(user);
+        uint256 shares = yzilp.deposit(200e6, user);
+        yzilp.approve(address(ilpHelper), shares);
+        vm.stopPrank();
+        (uint256 low,) = _bands(yzilp.previewRedeemOrder(shares), 100);
+        _setLimits(low - 1, type(uint256).max, type(uint256).max);
+
+        vm.prank(user);
+        vm.expectRevert(abi.encodeWithSelector(YuzuRedeemOrderHelper.MinAssetsOutUnreachable.selector, low, low - 1));
+        ilpHelper.createRedeemOrderWithMaxFee(shares, user, 1e6, 100, 1);
+        assertEq(yzilp.balanceOf(user), shares, "shares left the owner");
+    }
+
+    /// @dev With the guard off there is no band, so only `minAssetsOut` is checked against the
+    /// limits: the same order is accepted, and its fill is left to `AboveTxCap` (best-effort).
+    function test_Slippage_GuardOff_BandFloorNotChecked() public {
+        vm.startPrank(user);
+        uint256 shares = yzilp.deposit(200e6, user);
+        yzilp.approve(address(ilpHelper), shares);
+        vm.stopPrank();
+        (uint256 low,) = _bands(yzilp.previewRedeemOrder(shares), 100);
+        _setLimits(low - 1, type(uint256).max, type(uint256).max);
+
+        vm.prank(user);
+        uint256 orderId = ilpHelper.createRedeemOrderWithMaxFee(shares, user, 1e6, 100, 1);
+        assertEq(uint256(yzilp.getRedeemOrder(orderId).status), uint256(OrderStatus.Pending));
+    }
+
+    /// @dev A band floor exactly at the smallest limit is still payable by one fill.
+    function test_Slippage_CreateAcceptsBandFloorAtLimit() public {
+        _setSlippage(100); // 1%
+        vm.startPrank(user);
+        uint256 shares = yzilp.deposit(200e6, user);
+        yzilp.approve(address(ilpHelper), shares);
+        vm.stopPrank();
+        (uint256 low,) = _bands(yzilp.previewRedeemOrder(shares), 100);
+        _setLimits(low, type(uint256).max, type(uint256).max);
+
+        vm.prank(user);
+        uint256 orderId = ilpHelper.createRedeemOrderWithMaxFee(shares, user, 1e6, 100, 1);
+        assertEq(uint256(yzilp.getRedeemOrder(orderId).status), uint256(OrderStatus.Pending));
+    }
+
     /// @dev A sudden price jump after creation is the treasury's risk: above the band the fill
     /// reverts and the order stays Pending; a wider band lets the same fill through.
     function test_Slippage_SuddenJumpUpReverts_WiderBandFills() public {

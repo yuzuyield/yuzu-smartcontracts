@@ -118,9 +118,10 @@ import {Order, OrderStatus} from "../interfaces/proto/IYuzuOrderBookDefinitions.
  * @dev Outflow limits, set by `LIMIT_MANAGER_ROLE` and checked on every helper fill, in asset units
  * against the vault's own settled `order.assets`. A fill that breaks one reverts whole; the order
  * stays Pending for a later fill or a cancel. Orders consume nothing at creation, so a user cannot
- * reserve or burn capacity without the filler paying. Creation does reject a `minAssetsOut` above
- * the smallest configured limit, which no single fill could ever pay (capacity in use is not
- * checked there).
+ * reserve or burn capacity without the filler paying. Creation does reject an order whose lowest
+ * fillable payout (`minAssetsOut`, raised to the slippage band's lower edge while the guard is on)
+ * is above the smallest configured limit, which no single fill could ever pay (capacity in use is
+ * not checked there). With the guard off the band is not known, so this check is best-effort.
  *
  * - **Per-fill cap** (`txCap`) on a single order's payout.
  * - **Per-owner limit** (`accountLimit`) and **total limit** (`totalLimit`) over a rolling 24 hours,
@@ -145,7 +146,8 @@ import {Order, OrderStatus} from "../interfaces/proto/IYuzuOrderBookDefinitions.
  * 0 = off). At creation the helper records the vault's own quote for the order
  * (`orderExpectedAssets`), exact in that transaction because the order's fee is stamped in it; a
  * zero quote is rejected, and so is a `minAssetsOut` above the band's upper edge, which no fill
- * could meet. A helper fill then reverts if the settled payout moves more than
+ * could meet, or a band lower edge above the smallest outflow limit, which no fill could pay. A
+ * helper fill then reverts if the settled payout moves more than
  * `maxSlippageBps` from the quote in either direction (bands round up). The band is flat: it does
  * not widen with order age. Size it above the largest legitimate price move within the vault's
  * `fillWindow` (linear yield, a distribution, a restatement); a larger move blocks helper fills of
@@ -317,11 +319,6 @@ contract YuzuRedeemOrderHelper is IYuzuRedeemOrderHelper, AccessControlDefaultAd
         if (!IAccessControl(address(_vault)).hasRole(VAULT_ORDER_FILLER_ROLE, address(this))) {
             revert HelperNotVaultFiller();
         }
-        // No single fill can pay more than the smallest limit (a disabled limit is type(uint256).max).
-        uint256 limitBound = Math.min(txCap, Math.min(accountLimit, totalLimit));
-        if (minAssetsOut > limitBound) {
-            revert MinAssetsOutUnreachable(minAssetsOut, limitBound);
-        }
         _checkHelperFee(maxHelperFeeBps);
         uint256 feeTokens = _feeFor(tokens);
         if (feeTokens != 0) {
@@ -336,12 +333,21 @@ contract YuzuRedeemOrderHelper is IYuzuRedeemOrderHelper, AccessControlDefaultAd
             revert ZeroQuote();
         }
         orderExpectedAssets[orderId] = quote;
+        // The lowest payout a helper fill can settle at: the owner floor, raised to the band's lower
+        // edge while the slippage guard is on.
+        uint256 floor = minAssetsOut;
         uint256 bps = maxSlippageBps;
         if (bps != 0) {
-            (, uint256 high) = _slippageBand(quote, bps);
+            (uint256 low, uint256 high) = _slippageBand(quote, bps);
             if (minAssetsOut > high) {
                 revert MinAssetsOutUnreachable(minAssetsOut, high);
             }
+            floor = Math.max(minAssetsOut, low);
+        }
+        // No single fill can pay more than the smallest limit (a disabled limit is type(uint256).max).
+        uint256 limitBound = Math.min(txCap, Math.min(accountLimit, totalLimit));
+        if (floor > limitBound) {
+            revert MinAssetsOutUnreachable(floor, limitBound);
         }
         if (feeTokens != 0) {
             orderFeeTokens[orderId] = feeTokens;
