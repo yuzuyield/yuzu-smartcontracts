@@ -66,10 +66,11 @@ interface IYuzuRedeemOrderHelper {
     /// sized at exactly the vault minimum reverts while a helper fee is set. The fee rounds down, to
     /// zero for `tokens < 10_000 / feeBps`. Reverts `MinAssetsOutUnreachable` when no fill could meet
     /// `minAssetsOut`: while the slippage guard is on, when it is above the upper edge of the band
-    /// around the creation quote; and always, when it is above the smallest of `txCap`,
-    /// `accountLimit` and `totalLimit`. Reverts `QuoteBandAboveLimit` when, with the guard on, the
-    /// band's lower edge is above both `minAssetsOut` and that smallest limit: the order is too large
-    /// for any fill to pay.
+    /// around the creation quote; and when `minAssetsOut` itself is the binding floor (guard off,
+    /// or `minAssetsOut` at or above the band's lower edge) and is above the smallest of `txCap`,
+    /// `accountLimit` and `totalLimit`. Reverts `QuoteBandAboveLimit` instead when, with the guard
+    /// on, the band's lower edge is above both `minAssetsOut` and that smallest limit (whether or
+    /// not `minAssetsOut` is also above the limit): the order is too large for any fill to pay.
     /// @param tokens Vault shares to redeem, gross of the helper fee.
     /// @param receiver Address to receive the settled assets on finalize. May not be the helper or
     /// the vault (`InvalidReceiver`): a self-referential receiver makes the settlement path's

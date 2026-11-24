@@ -1676,6 +1676,23 @@ contract YuzuRedeemOrderHelperTest is YuzuV3TestBase {
         ilpHelper.createRedeemOrderWithMaxFee(shares, user, 1e6, 100, low + 1);
     }
 
+    /// @dev `minAssetsOut` above the smallest limit but below the band's lower edge (cap 95,
+    /// floor 97, band 99-101): the band floor binds, so the revert names the band, not the owner.
+    function test_Slippage_CreateRejectsFloorBetweenLimitAndBandLow() public {
+        _setSlippage(100); // 1%
+        vm.startPrank(user);
+        uint256 shares = yzilp.deposit(200e6, user);
+        yzilp.approve(address(ilpHelper), shares);
+        vm.stopPrank();
+        (uint256 low,) = _bands(yzilp.previewRedeemOrder(shares), 100);
+        uint256 limit = low - 2;
+        _setLimits(limit, type(uint256).max, type(uint256).max);
+
+        vm.prank(user);
+        vm.expectRevert(abi.encodeWithSelector(YuzuRedeemOrderHelper.QuoteBandAboveLimit.selector, low, limit));
+        ilpHelper.createRedeemOrderWithMaxFee(shares, user, 1e6, 100, low - 1);
+    }
+
     /// @dev With the guard off there is no band, so only `minAssetsOut` is checked against the
     /// limits: the same order is accepted, and its fill is left to `AboveTxCap` (best-effort).
     function test_Slippage_GuardOff_BandFloorNotChecked() public {
