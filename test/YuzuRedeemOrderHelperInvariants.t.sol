@@ -66,6 +66,7 @@ contract YuzuRedeemOrderHelperInvariantHandler is CommonBase, StdCheats, StdUtil
     uint256 public finalizedAtVaultCount;
     uint256 public userCancelCount;
     uint256 public whitelistBlockedCount;
+    uint256 public pausedFillBlockedCount;
     uint256 public adminCancelCount;
     uint256 public settleFeeCount;
 
@@ -203,6 +204,7 @@ contract YuzuRedeemOrderHelperInvariantHandler is CommonBase, StdCheats, StdUtil
         asset.mint(helperFiller, maxAssets);
         uint256 receiverBalBefore = asset.balanceOf(order.receiver);
         bool gated = _gated(order.owner);
+        bool helperPaused = helper.paused();
 
         vm.prank(helperFiller);
         try helper.fillAndFinalizeRedeemOrder(orderId, maxAssets, block.timestamp + 1 days) {
@@ -211,7 +213,9 @@ contract YuzuRedeemOrderHelperInvariantHandler is CommonBase, StdCheats, StdUtil
             actualAssetsDeliveredToReceivers += asset.balanceOf(order.receiver) - receiverBalBefore;
             helperFillCount++;
         } catch {
-            if (gated) whitelistBlockedCount++;
+            // A helper-pause revert says nothing about the whitelist: track it apart.
+            if (helperPaused) pausedFillBlockedCount++;
+            else if (gated) whitelistBlockedCount++;
         }
     }
 

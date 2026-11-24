@@ -52,6 +52,8 @@ import {Order, OrderStatus} from "../interfaces/proto/IYuzuOrderBookDefinitions.
  *   worse. Once the pause clears, the recovery paths are a new `fillAndFinalizeRedeemOrder`,
  *   `cancelOwnRedeemOrder` (`CANCEL_MANAGER_ROLE`), or the owner's own vault cancel after
  *   `dueTime`. `finalizeRedeemOrder` applies only to an order another vault filler already filled.
+ *   The helper's own pause (see **Pause** below) is separate: it stops helper fills up front,
+ *   before any asset moves, and leaves the vault-side paths open.
  *
  * @dev Two guards close gaps that only exist because this helper composes the vault's
  * deliberately *asynchronous* order path into a synchronous one:
@@ -111,9 +113,15 @@ import {Order, OrderStatus} from "../interfaces/proto/IYuzuOrderBookDefinitions.
  *   asset, so `receiver` stays the user, finalize
  *   stays permissionless, and {_settle}'s asset residual check is unchanged. Rounded down, so it
  *   never exceeds `feeBps` of `tokens`; `MAX_FEE_BPS` bounds the rate.
- * - **Pause.** `PAUSE_MANAGER_ROLE` can stop creation; only `UNPAUSE_MANAGER_ROLE` can restart it.
- *   The two are separate roles so a pauser (ops signer, monitoring bot) can stop the helper but
- *   never re-open it, and re-opening can sit with a slower signer.
+ * - **Pause.** `PAUSE_MANAGER_ROLE` can stop creation and helper fills
+ *   ({fillAndFinalizeRedeemOrder}); only `UNPAUSE_MANAGER_ROLE` can restart them. The two are
+ *   separate roles so a pauser (ops signer, monitoring bot) can stop the helper but never re-open
+ *   it, and re-opening can sit with a slower signer. Halting fills this way is how helper fills are
+ *   stopped before a restatement is staged (see **Restatement gate**). The recovery paths stay
+ *   open while paused: {cancelOwnRedeemOrder}, {finalizeRedeemOrder}, {settleFee}, and the owner's
+ *   own vault cancel after `dueTime`. The slippage band is flat, so a long pause can leave pending
+ *   orders outside it once fills resume; the remedies are the usual ones (`LIMIT_MANAGER_ROLE`
+ *   widens the band, `CANCEL_MANAGER_ROLE` cancels, or the owner cancels after `dueTime`).
  *
  * @dev Outflow limits, set by `LIMIT_MANAGER_ROLE` and checked on every helper fill, in asset units
  * against the vault's own settled `order.assets`. A fill that breaks one reverts whole; the order
@@ -372,6 +380,7 @@ contract YuzuRedeemOrderHelper is IYuzuRedeemOrderHelper, AccessControlDefaultAd
     // slither-disable-next-line reentrancy-benign
     function fillAndFinalizeRedeemOrder(uint256 orderId, uint256 maxAssets, uint256 execDeadline)
         external
+        whenNotPaused
         nonReentrant
     {
         _checkRole(FILLER_ROLE);
@@ -429,7 +438,7 @@ contract YuzuRedeemOrderHelper is IYuzuRedeemOrderHelper, AccessControlDefaultAd
         _settleFee(orderId);
     }
 
-    /// @notice Pauses order creation. An order already open stays fillable and finalizable.
+    /// @notice Pauses order creation and helper fills. Cancel, finalize and fee settlement stay open.
     function pause() external {
         _checkRole(PAUSE_MANAGER_ROLE);
         _pause();
