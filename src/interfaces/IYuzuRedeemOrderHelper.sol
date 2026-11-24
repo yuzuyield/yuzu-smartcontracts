@@ -66,10 +66,11 @@ interface IYuzuRedeemOrderHelper {
     /// sized at exactly the vault minimum reverts while a helper fee is set. The fee rounds down, to
     /// zero for `tokens < 10_000 / feeBps`. Reverts `MinAssetsOutUnreachable` when no fill could meet
     /// `minAssetsOut`: while the slippage guard is on, when it is above the upper edge of the band
-    /// around the creation quote; and always, when it is above the smallest of `txCap`,
-    /// `accountLimit` and `totalLimit`. Reverts `QuoteBandAboveLimit` when, with the guard on, the
-    /// band's lower edge is above both `minAssetsOut` and that smallest limit: the order is too large
-    /// for any fill to pay.
+    /// around the creation quote; and when `minAssetsOut` itself is the binding floor (guard off,
+    /// or `minAssetsOut` at or above the band's lower edge) and is above the smallest of `txCap`,
+    /// `accountLimit` and `totalLimit`. Reverts `QuoteBandAboveLimit` instead when, with the guard
+    /// on, the band's lower edge is above both `minAssetsOut` and that smallest limit (whether or
+    /// not `minAssetsOut` is also above the limit): the order is too large for any fill to pay.
     /// @param tokens Vault shares to redeem, gross of the helper fee.
     /// @param receiver Address to receive the settled assets on finalize. May not be the helper or
     /// the vault (`InvalidReceiver`): a self-referential receiver makes the settlement path's
@@ -97,18 +98,19 @@ interface IYuzuRedeemOrderHelper {
 
     /// @notice Fills and finalizes a pending order the helper controls in one transaction, pulling
     /// at most `maxAssets` from the caller and refunding any unused amount. Every revert leaves the
-    /// order in the state it was in. Reverts, for an order in any state, with
-    /// `AccessControlUnauthorizedAccount` (caller lacks `FILLER_ROLE`) or `ExecDeadlineExpired`,
-    /// and with `OrderNotPending` for an order already Filled, Finalized or Cancelled. For a Pending
-    /// order, reverts, leaving it Pending, with `OrderNotControlledByHelper`,
-    /// `VaultSettlementClosed` (pool update staged), `NotWhitelisted` (owner delisted since
-    /// creation, while `whitelistEnabled`), `MinAssetsOutNotMet` (below the owner floor),
-    /// `SlippageExceeded` (outside the band around the creation quote), or `AboveTxCap`,
+    /// order in the state it was in. Reverts, for an order in any state, with `EnforcedPause`
+    /// (helper paused), `AccessControlUnauthorizedAccount` (caller lacks `FILLER_ROLE`) or
+    /// `ExecDeadlineExpired`, and with `OrderNotPending` for an order already Filled, Finalized or
+    /// Cancelled. For a Pending order, reverts, leaving it Pending, with
+    /// `OrderNotControlledByHelper`, `VaultSettlementClosed` (pool update staged), `NotWhitelisted`
+    /// (owner delisted since creation, while `whitelistEnabled`), `MinAssetsOutNotMet` (below the
+    /// owner floor), `SlippageExceeded` (outside the band around the creation quote), or `AboveTxCap`,
     /// `AccountLimitExceeded` or `TotalLimitExceeded`. Also reverts, with the same effect, on
     /// `ResidualBalanceMismatch`, ERC-20 transfer and allowance errors (for example `maxAssets`
     /// below the settled amount), and vault errors from the fill or the finalize:
     /// `OrderOwnerNotRedeemer` (owner lost the vault's `REDEEMER_ROLE`) and `EnforcedPause` (vault
-    /// paused).
+    /// paused; the same selector as the helper's own pause, so `EnforcedPause` means the helper or
+    /// the vault is paused).
     /// @param orderId The vault's order id.
     /// @param maxAssets Upper bound on the assets the caller is willing to pay; the caller's own
     /// slippage guard against a fee change or price move since order creation.

@@ -447,9 +447,14 @@ contract YuzuRedeemOrderHelperTest is YuzuV3TestBase {
         ilpHelper.createRedeemOrderWithMaxFee(shares, user, 10_000, 100, 1); // 1% ceiling, under the 5% live fee
     }
 
-    function test_Pause_BlocksCreationOnly() public {
-        vm.prank(user);
+    /// @dev The helper pause stops both creation and helper fills; a paused fill reverts before any
+    /// asset moves and leaves the order Pending. After unpause both work again.
+    function test_Pause_BlocksCreationAndFills() public {
+        (uint256 orderId, uint256 expectedAssets) = _createOrder(user, 100e6);
+        vm.startPrank(user);
         uint256 shares = yzilp.deposit(200e6, user);
+        yzilp.approve(address(ilpHelper), shares); // _createOrder approved only its own shares
+        vm.stopPrank();
 
         vm.prank(admin);
         ilpHelper.pause();
@@ -458,12 +463,56 @@ contract YuzuRedeemOrderHelperTest is YuzuV3TestBase {
         vm.expectRevert(Pausable.EnforcedPause.selector);
         ilpHelper.createRedeemOrderWithMaxFee(shares, user, 1e6, 100, 1);
 
+        uint256 fillerBalBefore = asset.balanceOf(helperFiller);
+        vm.prank(helperFiller);
+        vm.expectRevert(Pausable.EnforcedPause.selector);
+        ilpHelper.fillAndFinalizeRedeemOrder(orderId, expectedAssets, block.timestamp + 1 days);
+        assertEq(uint256(yzilp.getRedeemOrder(orderId).status), uint256(OrderStatus.Pending), "order moved");
+        assertEq(asset.balanceOf(helperFiller), fillerBalBefore, "filler paid while paused");
+
         vm.prank(admin);
         ilpHelper.unpause();
 
+        _fill(orderId, expectedAssets);
+        assertEq(uint256(yzilp.getRedeemOrder(orderId).status), uint256(OrderStatus.Finalized));
         vm.prank(user);
-        uint256 orderId = ilpHelper.createRedeemOrderWithMaxFee(shares, user, 1e6, 100, 1);
-        assertEq(uint256(yzilp.getRedeemOrder(orderId).status), uint256(OrderStatus.Pending));
+        uint256 newOrderId = ilpHelper.createRedeemOrderWithMaxFee(shares, user, 1e6, 100, 1);
+        assertEq(uint256(yzilp.getRedeemOrder(newOrderId).status), uint256(OrderStatus.Pending));
+    }
+
+    /// @dev While the helper is paused every recovery path stays open: the helper cancel, the
+    /// finalize passthrough for an order another vault filler filled, and `settleFee`.
+    function test_Pause_RecoveryPathsStayOpen() public {
+        address collector = makeAddr("collector");
+        (uint256 toCancel,,,) = _createFeeOrder(collector);
+        (uint256 toFinalize,, uint256 finalizeFee,) = _createFeeOrder(collector);
+        (uint256 toSettle,, uint256 settleFeeTokens,) = _createFeeOrder(collector);
+
+        asset.mint(filler, 1_000e6);
+        _approve(filler, address(yzilp));
+        vm.startPrank(filler);
+        yzilp.fillRedeemOrder(toFinalize);
+        yzilp.fillRedeemOrder(toSettle);
+        vm.stopPrank();
+        vm.prank(user);
+        yzilp.finalizeRedeemOrder(toSettle);
+
+        vm.prank(admin);
+        ilpHelper.pause();
+
+        vm.prank(admin);
+        ilpHelper.cancelOwnRedeemOrder(toCancel);
+        assertEq(uint256(yzilp.getRedeemOrder(toCancel).status), uint256(OrderStatus.Cancelled));
+
+        vm.prank(other);
+        ilpHelper.finalizeRedeemOrder(toFinalize);
+        assertEq(uint256(yzilp.getRedeemOrder(toFinalize).status), uint256(OrderStatus.Finalized));
+
+        vm.prank(other);
+        ilpHelper.settleFee(toSettle);
+
+        assertEq(yzilp.balanceOf(collector), finalizeFee + settleFeeTokens, "fees not paid while paused");
+        assertEq(ilpHelper.totalEscrowedFeeShares(), 0, "escrow total not cleared");
     }
 
     function test_PauseSplit_PauserCannotUnpause() public {
@@ -1625,6 +1674,23 @@ contract YuzuRedeemOrderHelperTest is YuzuV3TestBase {
         vm.prank(user);
         vm.expectRevert(abi.encodeWithSelector(YuzuRedeemOrderHelper.MinAssetsOutUnreachable.selector, low + 1, low));
         ilpHelper.createRedeemOrderWithMaxFee(shares, user, 1e6, 100, low + 1);
+    }
+
+    /// @dev `minAssetsOut` above the smallest limit but below the band's lower edge (cap 95,
+    /// floor 97, band 99-101): the band floor binds, so the revert names the band, not the owner.
+    function test_Slippage_CreateRejectsFloorBetweenLimitAndBandLow() public {
+        _setSlippage(100); // 1%
+        vm.startPrank(user);
+        uint256 shares = yzilp.deposit(200e6, user);
+        yzilp.approve(address(ilpHelper), shares);
+        vm.stopPrank();
+        (uint256 low,) = _bands(yzilp.previewRedeemOrder(shares), 100);
+        uint256 limit = low - 2;
+        _setLimits(limit, type(uint256).max, type(uint256).max);
+
+        vm.prank(user);
+        vm.expectRevert(abi.encodeWithSelector(YuzuRedeemOrderHelper.QuoteBandAboveLimit.selector, low, limit));
+        ilpHelper.createRedeemOrderWithMaxFee(shares, user, 1e6, 100, low - 1);
     }
 
     /// @dev With the guard off there is no band, so only `minAssetsOut` is checked against the
