@@ -1,0 +1,199 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.30;
+
+/**
+ * @title IYuzuRedeemOrderHelper
+ * @notice Surface for a helper deployed beside a single yzILP V3 vault. A user creates a redeem
+ * order through the helper so the helper is recorded as the order's `controller`, which lets a
+ * permissioned filler `fill` and `finalize` the order in one transaction. The helper never
+ * custodies the underlying asset across calls; between creation and settlement it holds only the
+ * escrowed helper fee in vault shares — see `YuzuRedeemOrderHelper` for the custody invariants.
+ * @dev `cancelRedeemOrder` is deliberately absent from this surface: `ORDER_FILLER_ROLE` on the
+ * vault also confers unconditional force-cancel of any pending order, so the only reachable cancel
+ * path is the narrowed `cancelOwnRedeemOrder`, restricted to orders this helper created.
+ */
+interface IYuzuRedeemOrderHelper {
+    /// @notice Emitted when a user creates a redeem order through the helper.
+    event CreatedRedeemOrder(
+        uint256 indexed orderId,
+        address indexed owner,
+        address indexed receiver,
+        uint256 tokens,
+        uint256 maxFeePpm,
+        uint256 minAssetsOut
+    );
+
+    /// @notice Emitted when a filler fills and finalizes an order through the helper in one call.
+    event FilledAndFinalizedRedeemOrder(
+        uint256 indexed orderId, address indexed owner, address indexed receiver, uint256 maxAssets, uint256 settled
+    );
+
+    /// @notice Emitted when the helper cancels an order it created.
+    event CancelledRedeemOrder(uint256 indexed orderId, address indexed owner);
+
+    /// @notice Emitted when the helper fee rate or recipient changes.
+    event UpdatedFee(uint256 feeBps, address feeRecipient);
+
+    /// @notice Emitted when an escrowed helper fee is paid to `feeRecipient`, in vault shares, once
+    /// its order is finalized.
+    event ChargedFee(uint256 indexed orderId, address indexed owner, address indexed feeRecipient, uint256 feeTokens);
+
+    /// @notice Emitted when an escrowed helper fee is returned to the owner: the order was
+    /// cancelled, or no fee recipient is set when it settles.
+    event RefundedFee(uint256 indexed orderId, address indexed owner, uint256 feeTokens);
+
+    /// @notice Emitted when an account is added to or removed from the helper whitelist.
+    event UpdatedWhitelisted(address indexed account, bool allowed);
+
+    /// @notice Emitted when the helper whitelist is turned on or off.
+    event UpdatedWhitelistEnabled(bool enabled);
+
+    /// @notice Emitted when the per-fill cap or the rolling 24h limits change.
+    event UpdatedLimits(uint256 txCap, uint256 accountLimit, uint256 totalLimit);
+
+    /// @notice Emitted when the slippage guard changes.
+    event UpdatedMaxSlippage(uint16 maxSlippageBps);
+
+    /// @notice Emitted when `ADMIN_ROLE` recovers tokens held by the helper outside fee escrow.
+    event RescuedTokens(address indexed token, address indexed to, uint256 amount);
+
+    /// @notice Creates a redeem order with `owner = msg.sender` and `controller = address(this)`,
+    /// forwarding to the vault's own max-fee check (the vault also enforces its `REDEEMER_ROLE`
+    /// allowlist on the owner). While `whitelistEnabled`, the caller must be `isWhitelisted`, else
+    /// `NotWhitelisted`; the same check runs again at fill. The helper fee is pulled from the
+    /// caller's shares now and held in escrow (the order is for `tokens` minus it); see {settleFee}.
+    /// The vault's `minRedeemOrder` therefore applies to `tokens` net of the helper fee: an order
+    /// sized at exactly the vault minimum reverts while a helper fee is set. The fee rounds down, to
+    /// zero for `tokens < 10_000 / feeBps`. Reverts `MinAssetsOutUnreachable` when no fill could meet
+    /// `minAssetsOut`: while the slippage guard is on, when it is above the upper edge of the band
+    /// around the creation quote; and when `minAssetsOut` itself is the binding floor (guard off,
+    /// or `minAssetsOut` at or above the band's lower edge) and is above the smallest of `txCap`,
+    /// `accountLimit` and `totalLimit`. Reverts `QuoteBandAboveLimit` instead when, with the guard
+    /// on, the band's lower edge is above both `minAssetsOut` and that smallest limit (whether or
+    /// not `minAssetsOut` is also above the limit): the order is too large for any fill to pay.
+    /// @param tokens Vault shares to redeem, gross of the helper fee.
+    /// @param receiver Address to receive the settled assets on finalize. May not be the helper or
+    /// the vault (`InvalidReceiver`): a self-referential receiver makes the settlement path's
+    /// residual-balance equality unsatisfiable and strands the payout in the helper, and the vault
+    /// as receiver would pay the vault itself.
+    /// @param maxFeePpm Caller's fee ceiling; the vault reverts `FeeOverMaxFee` above it.
+    /// @param maxHelperFeeBps Caller's cap on the helper fee rate; reverts `HelperFeeAboveMax` if
+    /// `feeBps` is above it (e.g. an admin `setFee` landed first).
+    /// @param minAssetsOut The owner's price floor on the order's net settled assets (after both the
+    /// vault fee and the helper fee), enforced after fill and before finalize against the vault's
+    /// own settled `order.assets`. Must be non-zero: the filler chooses the fill block and the owner
+    /// cannot cancel before `dueTime`, so without a floor the fill carries no owner-side protection
+    /// against a price restatement in between. Together with the slippage band's lower edge, it
+    /// sets the lowest payout a helper fill can settle at, which creation checks against the
+    /// outflow limits (`MinAssetsOutUnreachable` if this floor binds, `QuoteBandAboveLimit` if the
+    /// band's lower edge does).
+    /// @return orderId The vault's order id.
+    function createRedeemOrderWithMaxFee(
+        uint256 tokens,
+        address receiver,
+        uint256 maxFeePpm,
+        uint256 maxHelperFeeBps,
+        uint256 minAssetsOut
+    ) external returns (uint256 orderId);
+
+    /// @notice Fills and finalizes a pending order the helper controls in one transaction, pulling
+    /// at most `maxAssets` from the caller and refunding any unused amount. Every revert leaves the
+    /// order in the state it was in. Reverts, for an order in any state, with `EnforcedPause`
+    /// (helper paused), `AccessControlUnauthorizedAccount` (caller lacks `FILLER_ROLE`) or
+    /// `ExecDeadlineExpired`, and with `OrderNotPending` for an order already Filled, Finalized or
+    /// Cancelled. For a Pending order, reverts, leaving it Pending, with
+    /// `OrderNotControlledByHelper`, `VaultSettlementClosed` (pool update staged), `NotWhitelisted`
+    /// (owner delisted since creation, while `whitelistEnabled`), `MinAssetsOutNotMet` (below the
+    /// owner floor), `SlippageExceeded` (outside the band around the creation quote), or `AboveTxCap`,
+    /// `AccountLimitExceeded` or `TotalLimitExceeded`. Also reverts, with the same effect, on
+    /// `ResidualBalanceMismatch`, ERC-20 transfer and allowance errors (for example `maxAssets`
+    /// below the settled amount), and vault errors from the fill or the finalize:
+    /// `OrderOwnerNotRedeemer` (owner lost the vault's `REDEEMER_ROLE`) and `EnforcedPause` (vault
+    /// paused; the same selector as the helper's own pause, so `EnforcedPause` means the helper or
+    /// the vault is paused).
+    /// @param orderId The vault's order id.
+    /// @param maxAssets Upper bound on the assets the caller is willing to pay; the caller's own
+    /// slippage guard against a fee change or price move since order creation.
+    /// @param execDeadline Caller's own staleness guard; reverts if `block.timestamp` exceeds it.
+    function fillAndFinalizeRedeemOrder(uint256 orderId, uint256 maxAssets, uint256 execDeadline) external;
+
+    /// @notice Permissionless passthrough to the vault's `finalizeRedeemOrder` for a filled order
+    /// this helper controls, then {settleFee}. A helper fill never leaves an order Filled (a vault
+    /// pause between fill and finalize reverts the whole fill), so this applies to an order another
+    /// vault filler filled; a Pending order reverts at the vault with `OrderNotFilled`. Reverts
+    /// `MinAssetsOutNotMet` for an order filled below its `orderMinAssetsOut`; only its owner can
+    /// then finalize it, directly at the vault. Not gated by a staged restatement: it pays only the
+    /// amount fixed at fill.
+    function finalizeRedeemOrder(uint256 orderId) external;
+
+    /// @notice Cancels a pending order the helper created, refusing every other order; restricted to
+    /// `CANCEL_MANAGER_ROLE`. The vault returns the order's shares to the owner and the escrowed
+    /// helper fee is refunded inline. This is the only reachable cancel path — see the
+    /// contract-level note on why an unrestricted passthrough is never exposed.
+    function cancelOwnRedeemOrder(uint256 orderId) external;
+
+    /// @notice Resolves the escrowed helper fee of an order from the vault's order
+    /// status: Finalized pays the current `feeRecipient` (or refunds the owner if there is none),
+    /// Cancelled refunds the owner. Callable by anyone; a no-op once settled. Reverts
+    /// `FeeNotSettleable` while the order is Pending or Filled (the payout has not happened yet).
+    function settleFee(uint256 orderId) external;
+
+    /// @notice The vault this helper is bound to.
+    function vault() external view returns (address);
+
+    /// @notice The underlying asset of `vault`.
+    function asset() external view returns (address);
+
+    /// @notice The owner's price floor recorded for `orderId` at creation, enforced at the helper
+    /// fill and by the {finalizeRedeemOrder} passthrough.
+    function orderMinAssetsOut(uint256 orderId) external view returns (uint256);
+
+    /// @notice The vault's quote for `orderId`'s payout, recorded at creation; the slippage guard's
+    /// reference.
+    function orderExpectedAssets(uint256 orderId) external view returns (uint256);
+
+    /// @notice The helper fee, in vault shares, escrowed for an order at creation;
+    /// zero once settled (charged or refunded).
+    function orderFeeTokens(uint256 orderId) external view returns (uint256);
+
+    /// @notice Sum of all escrowed helper fees; the share balance {rescueTokens} cannot touch.
+    function totalEscrowedFeeShares() external view returns (uint256);
+
+    /// @notice Helper fee in basis points of the shares redeemed, capped by `MAX_FEE_BPS`.
+    function feeBps() external view returns (uint16);
+
+    /// @notice Receives the helper fee, in vault shares.
+    function feeRecipient() external view returns (address);
+
+    /// @notice True while only `isWhitelisted` owners may create or be filled through the helper.
+    /// On from construction.
+    function whitelistEnabled() external view returns (bool);
+
+    /// @notice Whether `account` is on the helper's partner whitelist.
+    function isWhitelisted(address account) external view returns (bool);
+
+    /// @notice Largest single payout, in asset units, a helper fill may settle. 0 blocks every fill
+    /// and every new order.
+    function txCap() external view returns (uint256);
+
+    /// @notice Capacity, in assets, one order owner may receive through helper fills: a bucket of
+    /// this size that refills linearly over 24 hours. With an unchanged limit, cumulative payouts in
+    /// any 24 hours can approach twice the limit. `type(uint256).max` disables it; 0 blocks every
+    /// fill and every new order.
+    function accountLimit() external view returns (uint256);
+
+    /// @notice Capacity, in assets, all owners together may receive through helper fills, with the
+    /// same 24-hour linear refill as `accountLimit`. `type(uint256).max` disables it; 0 blocks every
+    /// fill and every new order.
+    function totalLimit() external view returns (uint256);
+
+    /// @notice Capacity `owner` has left under `accountLimit` now; `type(uint256).max` if disabled.
+    function remainingAccountLimit(address owner) external view returns (uint256);
+
+    /// @notice Capacity left under `totalLimit` now; `type(uint256).max` if disabled.
+    function remainingTotalLimit() external view returns (uint256);
+
+    /// @notice Largest allowed move, in basis points, of a helper fill's payout from
+    /// `orderExpectedAssets`, in either direction. 0 means the guard is off.
+    function maxSlippageBps() external view returns (uint16);
+}
