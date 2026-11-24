@@ -121,7 +121,9 @@ import {Order, OrderStatus} from "../interfaces/proto/IYuzuOrderBookDefinitions.
  * reserve or burn capacity without the filler paying. Creation does reject an order whose lowest
  * fillable payout (`minAssetsOut`, raised to the slippage band's lower edge while the guard is on)
  * is above the smallest configured limit, which no single fill could ever pay (capacity in use is
- * not checked there). With the guard off the band is not known, so this check is best-effort.
+ * not checked there): `MinAssetsOutUnreachable` when `minAssetsOut` is the binding term,
+ * `QuoteBandAboveLimit` when the band's lower edge is. With the guard off the band is not known,
+ * so this check is best-effort.
  *
  * - **Per-fill cap** (`txCap`) on a single order's payout.
  * - **Per-owner limit** (`accountLimit`) and **total limit** (`totalLimit`) over a rolling 24 hours,
@@ -146,7 +148,8 @@ import {Order, OrderStatus} from "../interfaces/proto/IYuzuOrderBookDefinitions.
  * 0 = off). At creation the helper records the vault's own quote for the order
  * (`orderExpectedAssets`), exact in that transaction because the order's fee is stamped in it; a
  * zero quote is rejected, and so is a `minAssetsOut` above the band's upper edge, which no fill
- * could meet, or a band lower edge above the smallest outflow limit, which no fill could pay. A
+ * could meet (`MinAssetsOutUnreachable`), or a band lower edge above `minAssetsOut` and above the
+ * smallest outflow limit, which no fill could pay (`QuoteBandAboveLimit`). A
  * helper fill then reverts if the settled payout moves more than
  * `maxSlippageBps` from the quote in either direction (bands round up). The band is flat: it does
  * not widen with order age. Size it above the largest legitimate price move within the vault's
@@ -254,6 +257,10 @@ contract YuzuRedeemOrderHelper is IYuzuRedeemOrderHelper, AccessControlDefaultAd
     error HelperNotVaultFiller();
     error AdminIsOperator(address account);
     error MinAssetsOutUnreachable(uint256 minAssetsOut, uint256 bound);
+    /// @notice The order is too large for the outflow limits: the slippage band's lower edge `low`
+    /// exceeds the smallest limit `limitBound`, so no fill can settle it. Reduce `tokens` or wait for
+    /// higher limits.
+    error QuoteBandAboveLimit(uint256 low, uint256 limitBound);
     error LimitsOutOfOrder(uint256 lower, uint256 upper);
 
     /// @param vault_ The yzILP V3 vault this helper is permanently bound to.
@@ -347,7 +354,10 @@ contract YuzuRedeemOrderHelper is IYuzuRedeemOrderHelper, AccessControlDefaultAd
         // No single fill can pay more than the smallest limit (a disabled limit is type(uint256).max).
         uint256 limitBound = Math.min(txCap, Math.min(accountLimit, totalLimit));
         if (floor > limitBound) {
-            revert MinAssetsOutUnreachable(floor, limitBound);
+            if (floor == minAssetsOut) {
+                revert MinAssetsOutUnreachable(minAssetsOut, limitBound);
+            }
+            revert QuoteBandAboveLimit(floor, limitBound);
         }
         if (feeTokens != 0) {
             orderFeeTokens[orderId] = feeTokens;

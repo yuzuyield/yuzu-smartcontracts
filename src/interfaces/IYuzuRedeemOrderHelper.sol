@@ -65,10 +65,11 @@ interface IYuzuRedeemOrderHelper {
     /// The vault's `minRedeemOrder` therefore applies to `tokens` net of the helper fee: an order
     /// sized at exactly the vault minimum reverts while a helper fee is set. The fee rounds down, to
     /// zero for `tokens < 10_000 / feeBps`. Reverts `MinAssetsOutUnreachable` when no fill could meet
-    /// `minAssetsOut` or pay the order: while the slippage guard is on, when `minAssetsOut` is above
-    /// the upper edge of the band around the creation quote; and always, when the lowest fillable
-    /// payout (`minAssetsOut`, raised to the band's lower edge while the guard is on) is above the
-    /// smallest of `txCap`, `accountLimit` and `totalLimit`.
+    /// `minAssetsOut`: while the slippage guard is on, when it is above the upper edge of the band
+    /// around the creation quote; and always, when it is above the smallest of `txCap`,
+    /// `accountLimit` and `totalLimit`. Reverts `QuoteBandAboveLimit` when, with the guard on, the
+    /// band's lower edge is above both `minAssetsOut` and that smallest limit: the order is too large
+    /// for any fill to pay.
     /// @param tokens Vault shares to redeem, gross of the helper fee.
     /// @param receiver Address to receive the settled assets on finalize. May not be the helper or
     /// the vault (`InvalidReceiver`): a self-referential receiver makes the settlement path's
@@ -83,7 +84,8 @@ interface IYuzuRedeemOrderHelper {
     /// cannot cancel before `dueTime`, so without a floor the fill carries no owner-side protection
     /// against a price restatement in between. Together with the slippage band's lower edge, it
     /// sets the lowest payout a helper fill can settle at, which creation checks against the
-    /// outflow limits.
+    /// outflow limits (`MinAssetsOutUnreachable` if this floor binds, `QuoteBandAboveLimit` if the
+    /// band's lower edge does).
     /// @return orderId The vault's order id.
     function createRedeemOrderWithMaxFee(
         uint256 tokens,

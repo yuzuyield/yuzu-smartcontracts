@@ -1594,7 +1594,8 @@ contract YuzuRedeemOrderHelperTest is YuzuV3TestBase {
     }
 
     /// @dev L2: with the guard on, no fill settles below the band's lower edge, so a band floor
-    /// above the smallest limit is refused at creation even when `minAssetsOut` itself fits.
+    /// above the smallest limit is refused at creation even when `minAssetsOut` itself fits, naming
+    /// the band rather than the owner's floor.
     function test_Slippage_CreateRejectsBandFloorAboveLimit() public {
         _setSlippage(100); // 1%
         vm.startPrank(user);
@@ -1605,9 +1606,25 @@ contract YuzuRedeemOrderHelperTest is YuzuV3TestBase {
         _setLimits(low - 1, type(uint256).max, type(uint256).max);
 
         vm.prank(user);
-        vm.expectRevert(abi.encodeWithSelector(YuzuRedeemOrderHelper.MinAssetsOutUnreachable.selector, low, low - 1));
+        vm.expectRevert(abi.encodeWithSelector(YuzuRedeemOrderHelper.QuoteBandAboveLimit.selector, low, low - 1));
         ilpHelper.createRedeemOrderWithMaxFee(shares, user, 1e6, 100, 1);
         assertEq(yzilp.balanceOf(user), shares, "shares left the owner");
+    }
+
+    /// @dev With the guard on, a `minAssetsOut` above both the band's lower edge and the smallest
+    /// limit is the binding term, so the revert still names the owner's floor.
+    function test_Slippage_CreateRejectsFloorAboveBandLowAndLimit() public {
+        _setSlippage(100); // 1%
+        vm.startPrank(user);
+        uint256 shares = yzilp.deposit(200e6, user);
+        yzilp.approve(address(ilpHelper), shares);
+        vm.stopPrank();
+        (uint256 low,) = _bands(yzilp.previewRedeemOrder(shares), 100);
+        _setLimits(low, type(uint256).max, type(uint256).max);
+
+        vm.prank(user);
+        vm.expectRevert(abi.encodeWithSelector(YuzuRedeemOrderHelper.MinAssetsOutUnreachable.selector, low + 1, low));
+        ilpHelper.createRedeemOrderWithMaxFee(shares, user, 1e6, 100, low + 1);
     }
 
     /// @dev With the guard off there is no band, so only `minAssetsOut` is checked against the
